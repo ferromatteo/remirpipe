@@ -1,258 +1,76 @@
 # REMIR Pipeline
 
-A complete astronomical image reduction and analysis pipeline for the **REM (Rapid Eye Mount) telescope's infrared camera**. This pipeline processes raw FITS images through calibration, sky subtraction, alignment, co-addition, astrometric calibration, and photometric analysis.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [Requirements](#requirements)
-- [Installation](#installation)
-- [Configuration](#configuration)
-- [Usage](#usage)
-- [Pipeline Workflow](#pipeline-workflow)
-  - [Step 1: File Preparation](#step-1-file-preparation)
-  - [Step 2: File Classification](#step-2-file-classification)
-  - [Step 3: Sky Subtraction](#step-3-sky-subtraction)
-  - [Step 4: Thermal Pattern Correction](#step-4-thermal-pattern-correction)
-  - [Step 5: Frame Alignment](#step-5-frame-alignment)
-  - [Step 6: Co-addition](#step-6-co-addition)
-  - [Step 7: Catalog Download](#step-7-catalog-download)
-  - [Step 8: Astrometric Calibration](#step-8-astrometric-calibration)
-  - [Step 9: Photometric Calibration](#step-9-photometric-calibration)
-- [Output Files](#output-files)
-- [Quality Control](#quality-control)
-- [Advanced Features](#advanced-features)
-- [Troubleshooting](#troubleshooting)
-
----
+Complete automated reduction and analysis pipeline for REMIR (REM InfraRed) FITS data.
 
 ## Overview
 
-The **REMIR Pipeline** (`remirpipe.py`) is designed to process near-infrared (NIR) astronomical images from the REM telescope's infrared camera. It automates the entire reduction process from raw data to calibrated, science-ready images with accurate astrometry and photometry.
-
-The pipeline supports multiple filters (J, H, K bands) and handles both "old" and "new" camera systems. It performs sophisticated operations including:
-
-- Automated flat-field calibration
-- Sky background subtraction using median-combining
-- Thermal pattern removal
-- Cross-correlation-based frame alignment
-- Robust co-addition with sigma clipping
-- Astrometric calibration using geometric quad matching
-- Photometric calibration against 2MASS catalog
-- Comprehensive quality assessment
-
----
+The REMIR pipeline performs end-to-end processing of near-infrared imaging data, from raw FITS files through calibration, alignment, co-addition, astrometric calibration, and photometric calibration. The pipeline is designed to handle dithered observations in J, H, and K bands with automatic source detection, catalog matching, and quality assessment.
 
 ## Features
 
-### Core Capabilities
-
-- **Automatic calibration**: Applies flat-field corrections based on filter and dither angle
-- **Sky subtraction**: Creates master sky frames from median-combined groups
-- **Thermal correction**: Removes detector thermal patterns using median filtering
-- **Frame alignment**: Sub-pixel alignment using cross-correlation with reference selection
-- **Image co-addition**: Combines aligned frames with sigma-clipped mean for optimal signal-to-noise
-- **Astrometric solution**: Geometric quad-matching algorithm with multiple fallback strategies
-- **Photometric calibration**: Zero-point determination using 2MASS catalog stars
-- **Quality metrics**: RMS, rejection rate, and zero-point consistency checks
-- **Standard star verification**: Validates calibration using standard star observations
-
-### Data Handling
-
-- **Format support**: FITS files, including gzipped (.fits.gz)
-- **Filter support**: J, H, K bands
-- **System compatibility**: Handles both "old" and "new" camera systems
-- **Multiple observation types**: Science (OBJECT), standard stars (STDSTAR), flats (FLATF), focus frames
-- **Incomplete groups**: Processes groups with missing frames or calibration data
-
-### Output Products
-
-- Calibrated, sky-subtracted individual frames (`*_c.fits`)
-- Aligned frames (`*_c_a.fits`)
-- Co-added images (`coadd_*.fits`)
-- Sky frames (`sky_*.fits`)
-- Astrometrically calibrated images (updated WCS in headers)
-- Photometric catalogs (embedded in FITS extensions)
-- Calibration plots (zero-point fitting)
-- Preview JPEG images for visual inspection
-- Comprehensive processing log (`pipelog.txt`)
-
----
+- **Automated calibration**: Bad pixel masking, flat field correction, thermal pattern subtraction
+- **Sky subtraction**: Sigma-clipped median sky estimation from dithered frames
+- **Frame alignment**: Geometric dither positioning with optional cross-match refinement
+- **Co-addition**: Noise-weighted combination of aligned frames
+- **Astrometric calibration**: Quad-matching algorithm with 2MASS/VSX catalog
+- **Photometric calibration**: Automated zeropoint fitting with outlier rejection
+- **Quality assessment**: RMS metrics, rejection statistics, standard star checks
+- **Batch processing**: Handles multiple targets, filters, and observation blocks
 
 ## Requirements
 
-### Python Version
-
-- Python 3.7 or higher
-
-### Dependencies
-
-The pipeline requires the following Python packages:
-
-```
-numpy
-scipy
-astropy
-photutils
-sep (Source Extractor Python)
-pandas
-matplotlib
-pyyaml
-requests
-```
-
-### External Services
-
-- **INAF/2MASS catalog service**: Used for downloading reference catalogs (requires internet connection)
-
-### Install Dependencies
+### Python Dependencies
 
 ```bash
-pip install numpy scipy astropy photutils sep pandas matplotlib pyyaml requests
+pip install numpy scipy astropy photutils matplotlib pyyaml
 ```
 
-Or if using conda:
+### Required packages:
+- `numpy` - Array operations
+- `scipy` - Image processing, spatial operations
+- `astropy` - FITS I/O, WCS, coordinate transformations
+- `photutils` - Aperture photometry
+- `matplotlib` - Preview generation
+- `pyyaml` - Configuration file parsing
 
-```bash
-conda install numpy scipy astropy photutils pandas matplotlib pyyaml requests
-pip install sep
+### Calibration Files
+
+Place calibration files in the `data_folder` (configured in `config.yaml`):
+
 ```
-
----
+data_2026_01/
+├── pixel_mask.fits                          # Bad pixel mask (0=bad, 1=good)
+├── J_dither0_flat.fits                      # Flat fields per filter/dither
+├── J_dither72_flat.fits
+├── H_dither0_flat.fits
+├── ...
+├── J_dither0_exptime30_thermal.fits         # Thermal templates (optional)
+└── ...
+```
 
 ## Installation
 
-1. Clone or download the repository containing `remirpipe.py`
+1. Clone or download the pipeline files:
+```bash
+cd /path/to/your/workspace
+```
 
-2. Ensure all dependencies are installed (see [Requirements](#requirements))
+2. Ensure `remirpipe.py` and `config.yaml` are in the same directory
 
-3. Create a `config.yaml` file (see [Configuration](#configuration))
-
-4. Make the pipeline executable (optional):
-
+3. Make the script executable (optional):
 ```bash
 chmod +x remirpipe.py
 ```
 
----
-
-## Configuration
-
-The pipeline is configured via a YAML file (`config.yaml`). By default, it looks for `config.yaml` in the same directory as the script.
-
-### Configuration File Structure
-
-The configuration file contains the following main sections:
-
-#### 1. Detection Parameters
-
-Controls source detection for astrometry and photometry:
-
-```yaml
-detection:
-  min_pixels: [5, 7, 10]  # Minimum connected pixels for source detection
-  threshold_sigma: [2.0, 2.5, 3.0]  # Detection threshold in sigma above background
-  aperture_radius: 8.0  # Aperture radius in pixels for photometry
-  margin_frac: 0.02  # Edge margin fraction for catalog matching
-```
-
-#### 2. Astrometry Parameters
-
-Controls astrometric calibration:
-
-```yaml
-astrometry:
-  num_quads: 100  # Number of geometric quads to build
-  n_sources_detected: 25  # Top N brightest detected sources to use
-  n_sources_catalog: 25  # Top N brightest catalog sources to use
-  min_sources: 3  # Minimum sources required to attempt astrometry
-  top_matches: 50  # Number of top quad matches to evaluate
-  min_matches_rank: 0  # Minimum rank for acceptable match
-  pix_tol: 2.0  # Pixel tolerance for star matching
-  scale_min: 0.95  # Minimum scale factor (when -s flag used)
-  scale_max: 1.05  # Maximum scale factor (when -s flag used)
-  try_reflection: true  # Try reflected image if normal fails
-  print_best_only: false  # Only print successful attempts
-  filter_fallback:
-    J: ['J', 'H']  # Fallback filters for J-band
-    H: ['H', 'J', 'K']  # Fallback filters for H-band
-    K: ['K', 'H']  # Fallback filters for K-band
-  catalog:
-    default_mag: 99.99  # Default magnitude for missing catalog entries
-```
-
-#### 3. Photometry Parameters
-
-Controls photometric calibration:
-
-```yaml
-photometry:
-  fixed_aperture_radius: 10.0  # Fixed aperture for final photometry
-  annulus_inner: 15.0  # Inner radius of sky annulus
-  annulus_outer: 20.0  # Outer radius of sky annulus
-  min_calibration_stars: 3  # Minimum stars for zero-point fit
-  sigma_clip: 3.0  # Sigma clipping threshold for outlier rejection
-  quality_thresholds:
-    rms:
-      very_good: 0.05  # RMS < 0.05 mag
-      good: 0.10  # RMS < 0.10 mag
-      medium: 0.20  # RMS < 0.20 mag
-      poor: 0.30  # RMS < 0.30 mag
-    rejection:
-      good: 0.10  # < 10% rejected
-      medium: 0.30  # < 30% rejected
-    zp_check:
-      very_good: 0.05  # |ZP diff| < 0.05 mag
-      good: 0.10  # |ZP diff| < 0.10 mag
-      medium: 0.20  # |ZP diff| < 0.20 mag
-      poor: 0.30  # |ZP diff| < 0.30 mag
-```
-
-#### 4. Image Processing Parameters
-
-```yaml
-sky_subtraction:
-  edge_fraction: 0.05  # Fraction of image edges to exclude from median
-
-thermal_correction:
-  enable: true  # Enable thermal pattern correction
-  filter_size: 51  # Median filter size for pattern detection
-
-alignment:
-  reference_selection: 'brightest'  # Method: 'brightest' or 'first'
-  max_shift: 50  # Maximum allowed shift in pixels
-
-coadd:
-  method: 'mean'  # Combination method: 'mean' or 'median'
-  sigma_clip: 3.0  # Sigma clipping threshold
-  scale_method: 'median'  # Scaling method before combining
-```
-
-#### 5. Catalog Parameters
-
-```yaml
-catalog:
-  service_url: 'http://cdsarc.u-strasbg.fr/viz-bin/asu-tsv'
-  catalog_name: '2MASS'
-  search_radius: 0.3  # Search radius in degrees
-  max_retries: 3  # Maximum download retry attempts
-  timeout: 60  # Download timeout in seconds
-```
-
----
+4. Install Python dependencies (see Requirements above)
 
 ## Usage
 
 ### Basic Usage
 
 ```bash
-python remirpipe.py -i /path/to/input/directory
+python remirpipe.py -i /path/to/input/data -o /path/to/output -v
 ```
-
-This will process all FITS files in the input directory and create output in the same directory.
 
 ### Command-Line Options
 
@@ -260,707 +78,288 @@ This will process all FITS files in the input directory and create output in the
 -i, --input DIR          Input directory with FITS files (required)
 -o, --output DIR         Output directory (default: same as input)
 -c, --config FILE        Configuration file (default: config.yaml in script directory)
--v, --verbose            Enable verbose output
--d, --delete-tmp         Delete tmp directory at the end
+-v, --verbose            Verbose output to console
+-d, --delete-tmp         Delete tmp/ directory after completion
 -s, --scale-constraint   Apply scale constraints (0.95-1.05) for astrometry
 -co, --clean-output      Clean existing output directories before starting
 ```
 
 ### Examples
 
-**Process with custom output directory:**
+**Process data with verbose output:**
 ```bash
-python remirpipe.py -i /data/raw -o /data/processed
+python remirpipe.py -i ./observations/2026-01-15 -v
 ```
 
-**Verbose mode with custom config:**
+**Process with custom config and clean output:**
 ```bash
-python remirpipe.py -i /data/raw -c my_config.yaml -v
+python remirpipe.py -i ./data -o ./reduced -c custom_config.yaml -co -v
 ```
 
-**Clean previous results and apply scale constraints:**
+**Apply strict astrometry and delete temp files:**
 ```bash
-python remirpipe.py -i /data/raw -co -s -v
+python remirpipe.py -i ./data -s -d -v
 ```
-
-**Process and clean up temporary files:**
-```bash
-python remirpipe.py -i /data/raw -d
-```
-
----
 
 ## Pipeline Workflow
 
-The pipeline processes data through multiple stages:
-
-### Step 1: File Preparation
-
-**Function**: `gunzip_files()`
-
-- Scans input directory recursively for `.fits.gz` files
-- Decompresses gzipped files using gzip magic number verification
-- Skips macOS resource fork files (`._*`)
-- Creates `.fits` files alongside compressed versions
-
-**Function**: `filter_and_prepare_files()`
-
-- Reads FITS headers from all `.fits` files
-- Filters out unwanted files:
-  - Files without required keywords (FILENAME, IMAGETYP, FILTER, DITHERX, DATE-OBS)
-  - Focus frames (IMAGETYP=FOCUS)
-  - Files with problematic data (NaN, Inf, zero std deviation)
-- Deletes problematic files
-- Updates global statistics
-
-### Step 2: File Classification
-
-**Function**: `classify_files()`
-
-- Determines processing type (PROCTYPE) from FITS headers:
-  - 0 = FLAT (OBSTYPE=FLATF)
-  - 1 = STDSTAR (OBSTYPE=STDSTAR)
-  - 2 = SCIENCE (IMAGETYP=OBJECT, not flat/std)
-  - -1 = FOCUS (skip)
-- Identifies camera system (old/new) from FILENAME pattern
-- Copies flats to `reduced/` directory
-- Generates preview JPEGs for flats
-- Creates calibration master flats (grouped by filter and dither angle)
-- Copies science and standard frames to appropriate system directories in `tmp/`
-
-**Grouping Logic**:
-- Files grouped by: FILTER, DITHERX, DITHERY, observation sequence
-- Groups identified by time gaps (default: 120 seconds between observations)
-
-### Step 3: Sky Subtraction
-
-**Function**: `process_group_sky_subtraction()`
-
-The pipeline creates master sky frames and performs sky subtraction:
-
-1. **Calibration Loading**:
-   - Loads flat-field based on filter and dither angle
-   - Falls back to median flat if specific flat not found
-
-2. **Frame Processing**:
-   - For each frame in group:
-     - Apply flat-field correction
-     - Normalize flat-fielding
-     - Store calibrated frame as `*_c.fits`
-
-3. **Sky Frame Creation**:
-   - Median-combines all calibrated frames in group
-   - Excludes edge regions (configurable fraction)
-   - Applies sigma-clipping to reject outliers
-   - Creates master sky: `sky_FILTER_YYYYMMDDThhmmss.fits`
-
-4. **Sky Subtraction**:
-   - Subtracts master sky from each calibrated frame
-   - Updates headers with processing keywords
-   - Adds DATE-OBS averaging if multiple frames combined
-
-**Output**: 
-- Calibrated frames: `*_c.fits`
-- Master sky: `sky_*.fits` (also copied to `reduced/`)
-
-### Step 4: Thermal Pattern Correction
-
-**Function**: `apply_thermal_correction()`
-
-Removes detector thermal patterns using advanced filtering:
-
-1. **Pattern Detection**:
-   - Applies large median filter to each frame (default: 51x51 pixels)
-   - Extracts low-frequency thermal pattern
-
-2. **Pattern Removal**:
-   - Subtracts detected pattern from frame
-   - Preserves astronomical sources and high-frequency structure
-
-3. **Quality Preservation**:
-   - Updates FITS headers with thermal correction keywords
-   - Maintains flux calibration
-
-**Note**: Can be disabled in config if thermal patterns are negligible.
-
-### Step 5: Frame Alignment
-
-**Function**: `align_frames()`
-
-Aligns frames within each group using cross-correlation:
-
-1. **Reference Selection**:
-   - Method 1 (`brightest`): Selects frame with most detected sources
-   - Method 2 (`first`): Uses first frame in group
-   - Configurable via `alignment.reference_selection`
-
-2. **Shift Calculation**:
-   - Uses FFT-based cross-correlation for sub-pixel precision
-   - Computes (dx, dy) shift for each frame relative to reference
-   - Reports shifts in pipeline log
-
-3. **Frame Registration**:
-   - Applies calculated shifts using scipy.ndimage.shift
-   - Uses spline interpolation for sub-pixel accuracy
-   - Maximum shift constraint prevents bad alignments
-
-4. **Header Updates**:
-   - Adds ALIGNED keyword
-   - Records shift values (DX_SHIFT, DY_SHIFT)
-   - Updates processing date
-
-**Output**: Aligned frames: `*_c_a.fits`
-
-### Step 6: Co-addition
-
-**Function**: `coadd_aligned_frames()`
-
-Combines aligned frames into single co-added image:
-
-1. **Data Preparation**:
-   - Loads all aligned frames
-   - Optionally scales to common median/mean
-
-2. **Robust Combination**:
-   - Method 1 (`mean`): Sigma-clipped mean (default)
-   - Method 2 (`median`): Simple median
-   - Sigma clipping rejects cosmic rays and outliers
-
-3. **Header Construction**:
-   - Averages DATE-OBS from all frames
-   - Sums EXPTIME (total exposure)
-   - Averages AIRMASS
-   - Copies filter, position, and system information
-   - Marks incomplete groups with INCOMP keyword
-
-4. **Quality Metrics**:
-   - Records number of combined frames (NCOMBINE)
-   - Updates global statistics
-
-**Output**: Co-added image: `coadd_FILTER_YYYYMMDDThhmmss.fits`
-
-### Step 7: Catalog Download
-
-**Function**: `download_catalogs_for_groups()`
-
-Downloads 2MASS reference catalogs for astrometry and photometry:
-
-1. **Position Grouping**:
-   - Groups co-adds by sky position (RA/DEC)
-   - Default grouping radius: configurable in catalog settings
-
-2. **Catalog Query**:
-   - Queries INAF/CDS 2MASS catalog service
-   - Search radius around target position (default: 0.3 degrees)
-   - Downloads J, H, K magnitudes and positions
-
-3. **Caching**:
-   - Saves catalogs to `catalogs/` directory
-   - Reuses existing catalogs if available
-   - Handles download failures with retries
-
-4. **Error Handling**:
-   - Logs download failures
-   - Pipeline exits if no catalogs downloaded
-   - Provides diagnostic messages for troubleshooting
-
-**Output**: Catalog files: `catalog_RA_DEC.csv`
-
-### Step 8: Astrometric Calibration
-
-**Function**: `try_astrometry()`
-
-Performs astrometric calibration using sophisticated geometric quad matching:
-
-#### Algorithm Overview
-
-1. **Multi-Parameter Search**:
-   - Tries combinations of detection parameters:
-     - `min_pixels`: Minimum connected pixels for sources
-     - `threshold_sigma`: Detection threshold
-     - Catalog filter: Primary filter + fallbacks (e.g., H → H, J, K)
-   - Optional reflection attempt if initial attempts fail
-
-2. **Source Detection**:
-   - Uses SEP (Source Extractor Python) for source detection
-   - Background estimation and subtraction
-   - Connected-component labeling
-   - Quality filters (minimum sources, brightness ranking)
-
-3. **Geometric Quad Building**:
-   - Creates geometric quads from brightest N sources
-   - Quad = 4 stars defining a quadrilateral
-   - Computes scale-invariant hash for each quad
-   - Uses heap-based selection for efficiency
-
-4. **Quad Matching**:
-   - Matches quads between detected sources and catalog
-   - Uses geometric similarity (ratio of distances)
-   - Finds consistent transformation patterns
-
-5. **Transform Computation**:
-   - Computes similarity transform (scale, rotation, translation)
-   - Applies transform to all catalog sources
-   - Counts matches within pixel tolerance
-
-6. **Transform Validation**:
-   - Verifies minimum number of matched stars
-   - Checks RMS residual of matched positions
-   - Optional scale constraint validation (if `-s` flag used)
-
-7. **WCS Fitting**:
-   - Uses matched star pairs to fit WCS
-   - astropy.wcs.utils.fit_wcs_from_points
-   - Updates FITS header with new WCS solution
-
-#### Attempt Strategy
-
-The pipeline tries multiple approaches in order:
-
-1. **Primary filter detection** (e.g., H-band for H-filter images)
-2. **Fallback filters** (e.g., J, K if H fails)
-3. **Varied detection parameters** (different thresholds, min_pixels)
-4. **Reflection attempt** (try vertically reflected image)
-
-Stops at first successful attempt unless configured otherwise.
-
-#### Success Criteria
-
-An attempt succeeds if:
-- Sufficient sources detected (≥ min_sources)
-- Quad matches found
-- Transform has enough star matches (≥ threshold)
-- RMS residual below threshold
-- Scale within bounds (if constraint enabled)
-
-**Output**: Updated WCS in co-add and aligned frame headers
-
-### Step 9: Photometric Calibration
-
-**Function**: `photometric_calibration()`
-
-Performs aperture photometry and zero-point calibration:
-
-#### Algorithm Steps
-
-1. **Optimal Aperture Determination**:
-   - For each calibration star (stars in catalog):
-     - Tries multiple aperture radii
-     - Selects aperture with minimum magnitude scatter
-   - Uses curve-of-growth analysis
-
-2. **Fixed-Aperture Photometry**:
-   - Measures all sources with optimal fixed aperture
-   - Applies sky annulus background subtraction
-   - Converts counts to instrumental magnitudes
-
-3. **Zero-Point Fitting**:
-   - Matches detected sources to catalog stars
-   - Computes zero-point for each star: ZP = mag_catalog - mag_instrumental
-   - Robust sigma-clipped mean of zero-points
-   - Rejects outliers (cosmic rays, bad pixels, etc.)
-
-4. **Calibration Quality Metrics**:
-   - RMS of zero-point fit
-   - Number of stars used vs. rejected
-   - Quality classification (VERY GOOD, GOOD, MEDIUM, POOR)
-
-5. **Full Source Measurement**:
-   - Applies zero-point to all detected sources
-   - Computes calibrated magnitudes
-   - Propagates uncertainties
-
-6. **Catalog Generation**:
-   - Creates FITS binary table extension with:
-     - X, Y pixel positions
-     - RA, DEC (from WCS)
-     - Instrumental magnitude
-     - Calibrated magnitude
-     - Uncertainties
-     - Flags (calibration star, edge, saturation)
-
-7. **Calibration Plot**:
-   - Plots instrumental vs. catalog magnitudes
-   - Shows zero-point fit and residuals
-   - Saves as PNG in reduced directory
-
-#### Quality Assessment
-
-**RMS Quality Levels**:
-- VERY GOOD: RMS < 0.05 mag
-- GOOD: RMS < 0.10 mag
-- MEDIUM: RMS < 0.20 mag
-- POOR: RMS < 0.30 mag
-- VERY POOR: RMS ≥ 0.30 mag
-
-**Rejection Quality**:
-- GOOD: < 10% stars rejected
-- MEDIUM: 10-30% stars rejected
-- POOR: > 30% stars rejected
-
-**Output**: 
-- Photometrically calibrated images with catalog extensions
-- Calibration plots: `calibration_FILENAME.png`
-- Updated FITS headers with zero-point keywords
-
----
-
-## Output Files
-
-### Directory Structure
+The pipeline executes the following steps automatically:
+
+### 1. **File Preparation**
+- Decompress `.fits.gz` files
+- Filter files by DITHID (removes incomplete sequences)
+- Fix invalid header values
+- Add FILENAME and PROCTYPE keywords
+- Apply bad pixel mask (sets masked pixels to NaN)
+
+### 2. **File Classification**
+- Classify by system (old/new dither mechanism)
+- Separate FLAT, FOCUS, STD, and SCI observations
+- Move files to appropriate directories
+
+### 3. **Grouping & Sky Subtraction**
+- Group by OBJECT/FILTER/OBSID/SUBID with time constraints
+- Validate dither completeness (5 positions expected)
+- Apply flat field correction per filter/dither
+- Compute sigma-clipped median sky from dithered frames
+- Subtract sky pattern
+- Apply thermal pattern correction (static or dynamic templates)
+
+### 4. **Alignment & Co-addition**
+- Compute geometric shifts from dither pattern
+- Optional: Refine alignment via source cross-matching
+- Shift frames to common grid with subpixel accuracy
+- Co-add with noise-weighted combination
+- Generate incomplete co-adds when needed
+
+### 5. **Catalog Download**
+- Query 2MASS catalog for field sources (J, H, K photometry)
+- Query VSX for known variable stars
+- Cache catalogs per sky position
+
+### 6. **Astrometric Calibration**
+- Detect sources with SEP (configurable thresholds)
+- Build geometric quads from brightest sources
+- Match detection/catalog quads via geometric hashing
+- Fit WCS with SIP distortion correction
+- Validate solution (match count, RMS residual)
+- Try multiple detection parameters until success
+
+### 7. **Photometric Calibration**
+- Detect sources in calibrated images
+- Filter isolated, central sources
+- Match detections to 2MASS catalog
+- Fit zeropoint with iterative sigma clipping
+- Calculate limiting magnitude
+- Generate diagnostic plots
+- Quality assessment (RMS, rejection rate)
+
+### 8. **Standard Star Validation**
+- Check PROCTYPE=1 observations against catalog
+- Compare field vs standard star zeropoints
+- Flag inconsistencies
+
+## Output Structure
 
 ```
-output_directory/
-├── tmp/                          # Temporary processing files
-│   ├── old/                      # Old camera system files
-│   └── new/                      # New camera system files
-├── reduced/                      # Final science-ready products
-│   ├── pipelog.txt              # Complete processing log
-│   ├── *_flat.fits              # Master flat fields
-│   ├── *_flat.jpg               # Flat field previews
-│   ├── sky_*.fits               # Master sky frames
-│   ├── sky_*.jpg                # Sky frame previews
-│   ├── coadd_*.fits             # Co-added science images
-│   ├── coadd_*.jpg              # Co-add previews
-│   ├── calibration_*.png        # Photometric calibration plots
-│   ├── *_STDSTAR_*.fits         # Processed standard star frames
-│   └── *_STDSTAR_*.jpg          # Standard star previews
-└── catalogs/                     # Downloaded reference catalogs
-    └── catalog_*.csv            # 2MASS catalog files
+output/
+├── tmp/                                      # Intermediate files
+│   ├── old/                                  # Pre-2025 dither system
+│   │   └── [grouped files]
+│   ├── new/                                  # Post-2025 dither system
+│   │   └── [grouped files]
+│   ├── skysub/                              # Sky-subtracted frames
+│   │   ├── OBJECT_OBSID_SUBID_FILTER_sky.fits
+│   │   └── [individual sky-subtracted files]
+│   ├── aligned/                             # Aligned frames
+│   │   └── [shifted frames ready for co-add]
+│   └── coadd/                               # Co-added images
+│       └── OBJECT_OBSID_SUBID_FILTER_coadd.fits
+├── catalogs/                                # Downloaded 2MASS/VSX catalogs
+│   └── catalog_RA_DEC.fits
+├── reduced/                                 # Final calibrated products
+│   ├── [coadd files with WCS]
+│   ├── [photometry catalogs .cat]
+│   ├── [photometry plots .png]
+│   └── [preview images .jpg] (if enabled)
+└── pipelog.txt                              # Complete processing log
 ```
 
-### File Naming Convention
+### Output File Types
 
-- **Calibrated frames**: `original_filename_c.fits`
-- **Aligned frames**: `original_filename_c_a.fits`
-- **Sky frames**: `sky_FILTER_YYYYMMDDThhmmss.fits`
-- **Co-adds**: `coadd_FILTER_YYYYMMDDThhmmss.fits`
-- **Master flats**: `FILTER_ditherANGLE_flat.fits`
+- **Sky frames** (`*_sky.fits`): DITHID=98, median sky pattern
+- **Co-adds** (`*_coadd.fits`): DITHID=99, combined aligned frames
+- **Reduced** (`reduced/*.fits`): Final images with WCS headers
+- **Catalogs** (`*.cat`): Photometry results with calibrated magnitudes
+- **Plots** (`*.png`): Instrumental vs catalog magnitude diagnostics
+- **Previews** (`*.jpg`): Quick-look images (optional)
 
-### FITS Header Keywords Added
+## Configuration
 
-#### Processing Keywords
-- `PROCTYPE`: Processing type (0=flat, 1=std, 2=sci)
-- `FLAT`: Flat field file used
-- `SKY`: Sky frame file used
-- `SKYSUB`: Sky subtraction applied (T/F)
-- `THERMCOR`: Thermal correction applied (T/F)
-- `ALIGNED`: Frame alignment applied (T/F)
-- `DX_SHIFT`, `DY_SHIFT`: Alignment shifts in pixels
-- `COADDED`: Co-addition applied (T/F)
-- `NCOMBINE`: Number of frames combined
-- `INCOMP`: Incomplete group flag
+All pipeline parameters are controlled via `config.yaml`. Key sections:
 
-#### Photometry Keywords
-- `ZPPOINT`: Photometric zero-point (mag)
-- `ZPPOINT_E`: Zero-point uncertainty (mag)
-- `ZPRMS`: RMS of zero-point fit (mag)
-- `ZPCALIB`: Number of calibration stars used
-- `ZPQUALITY`: RMS quality classification
-- `REJQUAL`: Rejection quality classification
-- `ZP_CHECK`: Zero-point consistency check
-- `MAGLIM`: Limiting magnitude (5-sigma)
+### Paths
+- `data_folder`: Location of calibration files
 
-### FITS Extensions
+### Calibration Toggles
+```yaml
+calibration:
+  enable_pixel_mask: true      # Bad pixel correction
+  enable_flat_correction: true # Flat fielding
+  enable_thermal_correction: true  # Thermal pattern subtraction
+  thermal_use_static: true     # Use pre-computed vs dynamic templates
+```
 
-Photometrically calibrated images include a binary table extension with:
+### Detection Parameters
+```yaml
+detection:
+  min_pixels: [10, 5]          # Connected pixel threshold (try in order)
+  threshold_sigma: [2.0, 1.2]  # Detection sigma (try in order)
+  aperture_radius: 3.5         # Photometry aperture [pixels]
+```
 
-| Column | Type | Description |
-|--------|------|-------------|
-| X | float | X pixel coordinate |
-| Y | float | Y pixel coordinate |
-| RA | float | Right ascension (degrees) |
-| DEC | float | Declination (degrees) |
-| MAG_INST | float | Instrumental magnitude |
-| MAG_INST_ERR | float | Instrumental magnitude error |
-| MAG_CAL | float | Calibrated magnitude |
-| MAG_CAL_ERR | float | Calibrated magnitude error |
-| FLUX | float | Source flux (counts) |
-| FLUX_ERR | float | Flux error (counts) |
-| IS_CALIB | bool | Calibration star flag |
-| FLAGS | int | Quality flags |
+### Astrometry
+```yaml
+astrometry:
+  min_matches_rank: 3          # Min stars for valid transform
+  min_match_fraction: 0.12     # Min fraction of sources matched
+  accept_rms_px: 1.5           # Max RMS residual [pixels]
+  filter_fallback:
+    J: ["J", "H"]              # Try J mags, then H
+    K: ["K", "H"]
+    H: ["H"]
+```
 
----
+### Photometry
+```yaml
+photometry:
+  enabled: true
+  aperture_radius: 3.0         # Fixed aperture [pixels]
+  central_fraction: 0.90       # Use central 90% of image
+  min_isolation_dist: 8.0      # Min source separation [pixels]
+  sigma_clip: 3.0              # Outlier rejection threshold
+  min_calibration_stars: 3     # Min stars for valid calibration
+```
 
-## Quality Control
+See `config.yaml` for complete documentation of all parameters.
 
-### Automated Quality Checks
+## Quality Metrics
 
-The pipeline performs comprehensive quality assessment:
+The pipeline reports several quality indicators:
 
-#### 1. RMS Quality
+### RMS Quality (photometric fit)
+- **VERY GOOD**: RMS < 0.1 mag
+- **GOOD**: RMS < 0.175 mag
+- **MEDIUM**: RMS < 0.25 mag
+- **POOR**: RMS < 0.35 mag
+- **VERY POOR**: RMS ≥ 0.35 mag
 
-Evaluates photometric precision based on zero-point fit RMS:
+### Rejection Quality
+- **GOOD**: < 25% stars rejected
+- **MEDIUM**: 25-50% rejected
+- **POOR**: ≥ 50% rejected
 
-- Computed from scatter of calibration stars
-- Indicates photometric stability
-- Threshold-based classification
+### Zeropoint Comparison (Standard vs Field)
+- **VERY GOOD**: |ΔZP| < 0.05 mag
+- **GOOD**: |ΔZP| < 0.1 mag
+- **MEDIUM**: |ΔZP| < 0.2 mag
+- **POOR**: |ΔZP| ≥ 0.2 mag
 
-#### 2. Rejection Quality
+## FITS Header Keywords
 
-Monitors outlier rejection rate:
+The pipeline adds/modifies the following keywords:
 
-- High rejection may indicate:
-  - Crowded field
-  - Poor seeing
-  - Detector artifacts
-  - Bad WCS solution
-
-#### 3. Zero-Point Consistency
-
-Validates calibration by comparing:
-
-- **Catalog zero-point**: From photometric calibration
-- **Standard star zero-point**: From observed standards
-
-Checks include:
-- Temporal proximity (standards vs. science)
-- Exposure time normalization
-- Expected zero-point agreement
-
-### Standard Star Verification
-
-**Function**: `check_standard_stars()`
-
-For STDSTAR observations:
-1. Measures instrumental magnitude
-2. Compares to catalog magnitude
-3. Derives zero-point independently
-4. Flags discrepancies with science calibration
-
-### Quality Summary Report
-
-At pipeline completion, comprehensive summary includes:
-
-- Processing statistics (files processed, success/failure rates)
-- Astrometry success breakdown by attempt signature
-- Photometry results table (zero-point, RMS, limiting magnitude)
-- Standard star check results
-- Zero-point consistency statistics
-- Quality flag distributions
-- Total processing time
-
----
-
-## Advanced Features
-
-### Incomplete Group Handling
-
-The pipeline can process groups with missing frames:
-
-- Identifies groups with < expected number of frames
-- Performs processing with available data
-- Marks output with `INCOMP` keyword
-- Logs incomplete group information
-
-### Reflection Detection
-
-For sources with unusual geometry (e.g., inverted optics):
-
-- Attempts standard astrometry first
-- If failed, tries vertically reflected image
-- Applies reflection transform to WCS if successful
-- Configured via `astrometry.try_reflection`
-
-### Multi-Filter Fallback
-
-If catalog matching fails in image filter:
-
-- Automatically tries related filters
-- Example: H-band image can use J or K catalog
-- Fallback hierarchy configured per filter
-- Maximizes astrometry success rate
-
-### Adaptive Parameter Search
-
-Astrometry uses grid search over parameters:
-
-- Multiple detection thresholds
-- Various minimum pixel counts
-- Different catalog filters
-- Stops at first success (efficient)
-
-### Background Modeling
-
-Sophisticated background estimation:
-
-- Median filtering for coarse background
-- Edge exclusion for sky frames
-- Annulus-based local background for photometry
-- Sigma-clipping for robustness
-
----
+- `PROCTYPE`: Processing type (0=FLAT, 1=STD, 2=SCI, -1=FOCUS)
+- `PROCSTAT`: Processing status (1=reduced)
+- `PSTATSUB`: Processing sub-status (1=sky, 2=skysub, 3=aligned, 4=coadd)
+- `DITHID`: Dither position (0-4) or special (98=sky, 99=coadd)
+- `FILENAME`: Original filename
+- `NCOADD`: Number of frames co-added
+- `ZP_*`: Photometric zeropoint and quality metrics
+- `MAG_LIM`: 3σ limiting magnitude
+- `HISTORY`: Processing steps and parameters
 
 ## Troubleshooting
 
 ### Common Issues
 
-#### 1. No catalogs downloaded
+**No sources detected:**
+- Lower `threshold_sigma` in config (try 1.0-1.5)
+- Reduce `min_pixels` (try 3-5)
+- Check if image is properly sky-subtracted
 
-**Symptoms**: Pipeline exits with "FATAL ERROR: Failed to download any catalogs"
+**Astrometry fails:**
+- Enable `scale_constraint: false` (try without -s flag)
+- Check initial WCS in header (RA, DEC, CRPIX)
+- Increase `catalog_radius_arcmin` for wider search
+- Try `try_reflection: true` if image may be flipped
 
-**Causes**:
-- No internet connection
-- INAF catalog service down
-- Firewall blocking requests
-- Invalid coordinates in FITS headers
+**Photometry calibration fails:**
+- Check filter is in `calibrate_filters` list (J/H/K only)
+- Verify 2MASS catalog has sufficient stars
+- Lower `min_calibration_stars` if field is sparse
+- Increase `match_tolerance` for low S/N images
 
-**Solutions**:
-- Check internet connectivity
-- Verify FITS header RA/DEC values
-- Try catalog service URL in browser
-- Wait and retry if service is down
-- Check firewall settings
+**Flat field not found:**
+- Check filename format: `{FILTER}_dither{ANGLE}_flat.fits`
+- Verify `data_folder` path in config
+- Dither angles should be 0, 72, 144, 216, 288
 
-#### 2. All astrometry attempts fail
+### Debug Tips
 
-**Symptoms**: "All attempts done for this coadd -> Final: FAILED"
+1. Run with `-v` flag for detailed output
+2. Check `pipelog.txt` for complete processing log
+3. Examine intermediate files in `tmp/` directory
+4. Use `-co` flag to start fresh (removes old outputs)
+5. Test with single observation before batch processing
 
-**Causes**:
-- Poor WCS initial guess in header
-- Too few sources detected
-- Catalog doesn't cover field
-- Large image distortion
+## Performance
 
-**Solutions**:
-- Check FITS header WCS keywords (CRVAL, CRPIX, CD matrix)
-- Lower detection threshold in config
-- Increase search radius for catalog
-- Use `-s` flag to constrain scale
-- Verify image quality (focus, seeing)
+Typical processing times (approximate):
+- File preparation: ~1-2 sec per file
+- Sky subtraction: ~2-5 sec per group
+- Alignment: ~1-2 sec per co-add
+- Astrometry: ~5-15 sec per co-add (depends on attempts)
+- Photometry: ~2-5 sec per co-add
 
-#### 3. SEP deblending overflow
+Total: ~30-60 seconds per observation block (varies with field complexity)
 
-**Symptoms**: "SEP error (skipping remaining attempts): deblending overflow"
+## Pipeline Statistics
 
-**Causes**:
-- Extremely crowded field
-- Large connected regions (nebulosity, artifacts)
+The pipeline tracks and reports:
+- Files processed by type (FLAT/STD/SCI/FOCUS)
+- Groups (complete/incomplete/defective)
+- Sky frames created
+- Co-adds generated
+- Astrometry success/failure rate
+- Photometry calibrations performed
 
-**Solutions**:
-- Increase `threshold_sigma` in config
-- Increase `min_pixels` in config
-- Pre-process image to remove large-scale structure
+Statistics are printed at pipeline completion.
 
-#### 4. Poor photometric RMS
+## Authors & Credits
 
-**Symptoms**: ZPRMS > 0.2 mag, quality = POOR or VERY POOR
+REMIR Pipeline developed for the REM telescope data reduction.
 
-**Causes**:
-- Variable seeing
-- Crowded field
-- Wrong aperture size
-- Poor astrometry
-- Non-photometric conditions
+**Dependencies:**
+- [Astropy](https://www.astropy.org/) - Astronomy Python library
+- [Photutils](https://photutils.readthedocs.io/) - Photometry tools
+- [SEP](https://sep.readthedocs.io/) - Source extraction (via photutils)
+- [2MASS Point Source Catalog](https://irsa.ipac.caltech.edu/Missions/2mass.html) - Astrometric/photometric reference
+- [VSX](https://www.aavso.org/vsx/) - Variable Star Index
 
-**Solutions**:
-- Check WCS solution quality
-- Adjust aperture parameters in config
-- Verify catalog match positions
-- Inspect calibration plot
-- Consider observing conditions
+## License
 
-#### 5. High rejection rate
+See project repository for license information.
 
-**Symptoms**: REJQUAL = POOR, > 30% stars rejected
+## Version History
 
-**Causes**:
-- Crowded field (confusion, blending)
-- Artifacts (cosmic rays, bad pixels)
-- Poor WCS (wrong star matching)
-
-**Solutions**:
-- Inspect image for artifacts
-- Check astrometry quality
-- Adjust sigma_clip threshold
-- Verify catalog match quality
-
-### Debug Strategies
-
-1. **Use verbose mode**: `-v` flag provides detailed logging
-
-2. **Check intermediate files**: Inspect `tmp/` directory for:
-   - Calibrated frames (`*_c.fits`)
-   - Sky frames quality
-   - Aligned frame shifts
-
-3. **Examine headers**: Use `fitsheader` or similar to check:
-   - WCS keywords after astrometry
-   - Processing keywords
-   - Quality metrics
-
-4. **Review log file**: `reduced/pipelog.txt` contains:
-   - All processing steps
-   - Error messages
-   - Attempt details
-   - Quality metrics
-
-5. **Inspect plots**: Check calibration PNG files for:
-   - Outliers in photometry
-   - Systematik trends
-   - Zero-point fit quality
-
-### Performance Optimization
-
-**For large datasets**:
-
-- Use `-d` flag to delete temporary files
-- Use `-co` flag to clean previous runs
-- Process in smaller batches
-- Monitor disk space
-
-**For slow astrometry**:
-
-- Reduce `num_quads` in config
-- Limit `top_matches` to evaluate
-- Enable `print_best_only` to reduce logging
-- Use fewer parameter combinations
+- **v1.0** (2026-01) - Initial release with complete reduction pipeline
+  - Bad pixel masking, flat correction, thermal correction
+  - Automated astrometry via quad matching
+  - Photometric calibration with 2MASS
+  - Quality assessment and standard star validation
 
 ---
 
-## Pipeline Summary
-
-The REMIR pipeline provides a complete, automated solution for processing near-infrared astronomical images. Key strengths include:
-
-- **Robustness**: Multiple fallback strategies for astrometry
-- **Automation**: Minimal user intervention required
-- **Quality**: Comprehensive metrics and validation
-- **Flexibility**: Highly configurable via YAML
-- **Transparency**: Detailed logging and intermediate products
-
-The pipeline transforms raw telescope data into science-ready, calibrated images with accurate astrometry and photometry, suitable for time-domain astronomy, photometric studies, and archival analysis.
-
----
-
-## Additional Resources
-
-### Related Tools
-
-- **DS9**: FITS image visualization
-- **Topcat**: Catalog analysis and visualization
-- **Astropy**: Python astronomy library
-- **STILTS**: Catalog manipulation
-
-### References
-
-- **2MASS Catalog**: [IPAC](https://www.ipac.caltech.edu/2mass/)
-- **SEP**: [Source Extractor Python](https://sep.readthedocs.io/)
-- **Astropy WCS**: [Documentation](https://docs.astropy.org/en/stable/wcs/)
-- **REM Telescope**: [INAF](http://www.rem.inaf.it/)
-
----
-
-## Contact & Support
-
-For issues specific to this pipeline implementation, check:
-
-1. Log files in `reduced/pipelog.txt`
-2. FITS headers for processing keywords
-3. Calibration plots for photometry issues
-4. Configuration file settings
-
----
-
-**Version**: 1.0  
-**Last Updated**: February 2026  
-**Author**: REMIR Pipeline Development Team
+For detailed parameter descriptions, see comments in `config.yaml`.  
+For algorithm details, review inline documentation in `remirpipe.py`.
