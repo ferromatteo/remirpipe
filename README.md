@@ -190,8 +190,8 @@ output/
 - **Sky frames** (`*_sky.fits`): DITHID=98, median sky pattern
 - **Co-adds** (`*_coadd.fits`): DITHID=99, combined aligned frames
 - **Reduced** (`reduced/*.fits`): Final images with WCS headers
-- **Catalogs [Astrometry] ** (`*.csv`): Astrometry 2MASS/VSX catalogs with know source positions
-- **Catalogs [Photometry] ** (`*.txt`): Photometry results with calibrated magnitudes
+- **Catalogs** **[Astrometry]** (`*.csv`): Astrometry 2MASS/VSX catalogs with know source positions
+- **Catalogs** **[Photometry]** (`*.txt`): Photometry results with calibrated magnitudes
 - **Plots** (`*.png`): Instrumental vs catalog magnitude diagnostics
 - **Previews** (`*.jpg`): Quick-look images (optional)
 
