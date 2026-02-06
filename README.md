@@ -176,10 +176,10 @@ output/
 │   └── coadd/                               # Co-added images
 │       └── OBJECT_OBSID_SUBID_FILTER_coadd.fits
 ├── catalogs/                                # Downloaded 2MASS/VSX catalogs
-│   └── catalog_RA_DEC.fits
+│   └── catalog_RA_DEC.csv
 ├── reduced/                                 # Final calibrated products
 │   ├── [coadd files with WCS]
-│   ├── [photometry catalogs .cat]
+│   ├── [photometry catalogs .txt]
 │   ├── [photometry plots .png]
 │   └── [preview images .jpg] (if enabled)
 └── pipelog.txt                              # Complete processing log
@@ -190,7 +190,8 @@ output/
 - **Sky frames** (`*_sky.fits`): DITHID=98, median sky pattern
 - **Co-adds** (`*_coadd.fits`): DITHID=99, combined aligned frames
 - **Reduced** (`reduced/*.fits`): Final images with WCS headers
-- **Catalogs** (`*.cat`): Photometry results with calibrated magnitudes
+- **Catalogs [Astrometry] ** (`*.csv`): Astrometry 2MASS/VSX catalogs with know source positions
+- **Catalogs [Photometry] ** (`*.txt`): Photometry results with calibrated magnitudes
 - **Plots** (`*.png`): Instrumental vs catalog magnitude diagnostics
 - **Previews** (`*.jpg`): Quick-look images (optional)
 
