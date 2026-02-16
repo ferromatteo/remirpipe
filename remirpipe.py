@@ -4340,7 +4340,19 @@ def main():
     logging.info("")
     logging.info("Grouping coadds by position and downloading catalogs...")
     
-    position_groups = group_coadds_by_position(all_coadd_files, config, args.verbose)
+    # When -t/--target is given, only download catalogs for matching OBJECTs
+    if args.target:
+        coadds_for_catalogs = []
+        for cp in all_coadd_files:
+            with fits.open(cp) as _hdul:
+                obj = _hdul[0].header.get('OBJECT', '').strip()
+            if obj in args.target:
+                coadds_for_catalogs.append(cp)
+        logging.info(f"  Target filter active: {len(coadds_for_catalogs)}/{len(all_coadd_files)} coadds match {args.target}")
+    else:
+        coadds_for_catalogs = all_coadd_files
+    
+    position_groups = group_coadds_by_position(coadds_for_catalogs, config, args.verbose)
     catalog_map = download_catalogs_for_groups(position_groups, config, catalog_dir, args.verbose)
     
     # Check if any catalogs were downloaded
@@ -4370,7 +4382,9 @@ def main():
 
     for coadd_path in all_coadd_files:
         if coadd_path not in catalog_map:
-            logging.warning(f"No catalog for {os.path.basename(coadd_path)}")
+            save_without_astrometry(coadd_path, reduced_dir, config)
+            for aligned_path in coadd_to_aligned.get(coadd_path, []):
+                save_without_astrometry(aligned_path, reduced_dir, config)
             continue
 
         catalog_path = catalog_map[coadd_path]

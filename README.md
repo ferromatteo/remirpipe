@@ -224,6 +224,7 @@ The pipeline executes these steps automatically:
   - Cross-match variables with 2MASS (0.5″ tolerance, configurable)
 - Cache catalogs: `catalogs/catalog_{RA}_{DEC}.csv`
 - **Grouping**: Images within 1 arcmin share same catalog (configurable `grouping_tolerance_arcmin`)
+- **Target filtering** (`-t`): When target names are specified, catalogs are only downloaded for coadds whose OBJECT matches the target list. Non-matching coadds skip catalog download entirely.
 
 ### 8. Astrometric Calibration
 
@@ -264,6 +265,11 @@ The pipeline executes these steps automatically:
 8. **Filter skipping**
    - Filters in `skip_filters` list (e.g., GRISM, H2) bypass astrometry entirely
    - These coadds and their aligned frames are copied to `reduced/` as-is
+
+9. **Target filtering** (`-t`)
+   - When `-t` is used, only coadds whose OBJECT header matches the given target(s) undergo astrometry and photometry
+   - Non-matching coadds and their aligned frames are saved to `reduced/` without astrometric/photometric calibration
+   - All earlier processing steps (sky subtraction, alignment, coadding) run on every file regardless of `-t`
 
 **Output**: WCS-calibrated FITS in `reduced/` directory with `_astro.fits` suffix (e.g., `OBJECT_OBSID_SUBID_FILTER_astro.fits`). Files that fail astrometry are copied without the `_astro` suffix.
 
