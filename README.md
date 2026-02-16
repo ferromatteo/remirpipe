@@ -818,7 +818,7 @@ Breakdown of successful attempts (thresh-npix-filter-reflection):
    35 x th=1.2-np=5-f=H-ref=0
 ```
 
-### Batch Processing
+## Batch Processing
 
 If you downloaded data spanning multiple nights, the archive unpacks as separate date folders:
 
