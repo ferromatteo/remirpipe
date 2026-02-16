@@ -782,7 +782,7 @@ Typical processing times (approximate, single-core):
 | Sky subtraction | ~3-5 sec/group | N=5 dithers |
 | Alignment | ~2-3 sec/coadd | Drizzling algorithm |
 | Co-addition | ~1-2 sec/coadd | Inverse-variance weighted |
-| Astrometry | ~5-30 sec/coadd | Varies with attempts |
+| Astrometry | ~2-10 sec/coadd | Varies with attempts |
 | Photometry | ~2-5 sec/coadd | Source detection + matching |
 
 **Total**: ~30-90 seconds per observation block (5 dithers → 1 co-add)
