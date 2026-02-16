@@ -820,6 +820,30 @@ Breakdown of successful attempts (thresh-npix-filter-reflection):
    35 x th=1.2-np=5-f=H-ref=0
 ```
 
+### Batch Processing
+
+If you downloaded data spanning multiple nights, the archive unpacks as separate date folders:
+
+```
+all_nights/
+├── 20260115/
+├── 20260116/
+├── ...
+└── 20260130/
+```
+
+Run the pipeline on every night with a single loop:
+
+```bash
+cd all_nights/
+for dir in */; do
+    echo "========== Processing: $dir =========="
+    python remirpipe.py -i "$dir" -o "$dir"/proc -s -v -co -t OBJECT_NAME
+done
+```
+
+A companion extraction notebook (`extract_lightcurve.py`) can then collect all `*_photometry.txt` files across nights and build a time-sorted light curve — see the notebook header for documentation.
+
 ## Authors & Credits
 
 **REMIR Pipeline** - Automated reduction for REM telescope near-infrared data
