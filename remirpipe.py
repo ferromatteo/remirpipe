@@ -3215,7 +3215,8 @@ def generate_photometry_plot(mag_inst_all, mag_cat_all, mag_inst_err_all,
 def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err, 
                            rms, n_stars, aperture_radius, filter_name, filename,
                            config, mag_lim=None, threshold_sigma=None, min_pixels=None, n_total=None,
-                           date_obs=None, exptime=None, object_name=None):
+                           date_obs=None, exptime=None, object_name=None,
+                           is_coadd=False, ncoadd=None):
     """Save photometry catalog as .txt file with calibration info in header.
     
     Columns: ra dec x y mag_inst e_mag_inst mag_cat e_mag_cat mag_cal e_mag_cal flag
@@ -3235,6 +3236,10 @@ def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err,
             f.write(f"# DATE-OBS: {date_obs}\n")
         if exptime is not None:
             f.write(f"# EXPTIME: {exptime} s\n")
+        if is_coadd:
+            f.write(f"# Image type: COADD ({ncoadd} frames)\n")
+        else:
+            f.write(f"# Image type: SINGLE\n")
         f.write(f"# Filter: {filter_name}\n")
         f.write(f"# Zeropoint: {zeropoint:.4f} +/- {zeropoint_err:.4f} mag\n")
         f.write(f"# RMS residuals: {rms:.4f} mag\n")
@@ -3332,6 +3337,14 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
     filter_name = header.get('FILTER', 'H').strip().upper()
     filename = os.path.basename(fits_path)
     exptime = header.get('EXPTIME', 0.0)
+    
+    # Determine if this is a coadd or single frame
+    dithid = header.get('DITHID', -1)
+    pstatsub = header.get('PSTATSUB', -1)
+    dithid_coadd = config['fits_markers']['dithid_coadd']
+    pstatsub_coadd = config['fits_markers']['pstatsub_coadd']
+    is_coadd = (dithid == dithid_coadd) or (pstatsub == pstatsub_coadd)
+    ncoadd = header.get('NCOADD', None)
     
     # Check if filter should be calibrated
     calibrate_filters = phot_cfg.get('calibrate_filters', ['J', 'H', 'K'])
@@ -3608,7 +3621,9 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         n_total=n_total,
         date_obs=header.get('DATE-OBS'),
         exptime=header.get('EXPTIME'),
-        object_name=header.get('OBJECT', None)
+        object_name=header.get('OBJECT', None),
+        is_coadd=is_coadd,
+        ncoadd=ncoadd
     )
     
     if verbose:

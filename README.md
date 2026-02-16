@@ -321,6 +321,7 @@ The pipeline executes these steps automatically:
 - `Rejection quality`: Classification
 - `MagLim`: 3σ limiting magnitude [mag]
 - `OBJECT`: Target name from FITS header
+- `Image type`: `COADD (N frames)` or `SINGLE` — identifies whether the image is a co-add (with frame count) or an individual aligned frame
 
 **Only JHK filters** are photometrically calibrated (configured via `calibrate_filters`). Filters without 2MASS data (Z, GRI, H2) are skipped.
 
@@ -782,7 +783,7 @@ Typical processing times (approximate, single-core):
 | Sky subtraction | ~3-5 sec/group | N=5 dithers |
 | Alignment | ~2-3 sec/coadd | Drizzling algorithm |
 | Co-addition | ~1-2 sec/coadd | Inverse-variance weighted |
-| Astrometry | ~2-10 sec/coadd | Varies with attempts |
+| Astrometry | ~5-30 sec/coadd | Varies with attempts |
 | Photometry | ~2-5 sec/coadd | Source detection + matching |
 
 **Total**: ~30-90 seconds per observation block (5 dithers → 1 co-add)
