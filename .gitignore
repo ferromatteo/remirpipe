@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+tmp/
+reduced/
+catalogs/
+*.fits
+*.fits.gz
+*.jpg
+*.png
+data_*/
+.DS_Store

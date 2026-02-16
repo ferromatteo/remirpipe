@@ -1,0 +1,302 @@
+# REMIR Pipeline Configuration File
+# All parameters for the pipeline in one place
+
+# ============================================================================
+# PATHS
+# ============================================================================
+paths:
+  data_folder: data_2026_01    # Folder containing all calibration files (relative to script)
+                               # Contains: pixel_mask.fits, 
+                               #           {FILTER}_dither{ANGLE}_flat.fits,
+                               #           {FILTER}_dither{ANGLE}_exptime{SEC}_thermal.fits (optional)
+
+# ============================================================================
+# FITS HEADER MARKERS
+# ============================================================================
+fits_markers:
+  dithid_sky: 98               # DITHID value for sky frames
+  dithid_coadd: 99             # DITHID value for coadded frames
+  dithid_exclude: [98, 99]     # DITHID values to delete during preparation
+  proctype_flat: 0             # PROCTYPE for flat fields
+  proctype_std: 1              # PROCTYPE for standard stars
+  proctype_sci: 2              # PROCTYPE for science frames
+  proctype_focus: -1           # PROCTYPE for focus frames
+  procstat_reduced: 1          # PROCSTAT for reduced frames
+  pstatsub_sky: 1              # PSTATSUB for sky frames
+  pstatsub_skysub: 2           # PSTATSUB for sky-subtracted frames
+  pstatsub_aligned: 3          # PSTATSUB for aligned frames
+  pstatsub_coadd: 4            # PSTATSUB for coadded frames
+
+# ============================================================================
+# DETECTOR PARAMETERS & CALIBRATION TOGGLES
+# ============================================================================
+detector:
+  gain: 5.0                    # Detector gain [e-/ADU] - converts ADU to electrons (5.0 NOMINAL FROM HEADER)
+  read_noise: 25               # Read noise [e-] - detector readout noise (100 NOMINAL FROM HEADER, NICS has 25 for the RRR mode)
+  pixel_scale: 1.221           # Pixel scale [arcsec/pixel] - plate scale of REMIR
+
+# ============================================================================
+# CALIBRATION CORRECTIONS (each can be enabled/disabled independently)
+# ============================================================================
+calibration:
+  # 1) Bad pixel mask - applied during file preparation
+  enable_pixel_mask: true      # Apply bad pixel mask
+  mask_file: pixel_mask.fits   # Bad pixel mask FITS in data_folder (0=bad, 1=good), or null
+  
+  # 2) Flat field correction - applied after sky subtraction
+  enable_flat_correction: true # Apply flat field correction (data / flat)
+  
+  # 3) Thermal residual correction - post-processing after sky subtraction
+  # Scales all skysub files to 10s reference, takes median → thermal template
+  # Applies template scaled by EXPTIME/10 (linear thermal assumption)
+  enable_thermal_correction: true    # Apply thermal residual correction
+  thermal_filters: [K]      # Filters for thermal residual correction
+  
+  # Thermal correction diversity requirements
+  # The template is reliable only when built from many files spanning
+  # several distinct sky pointings (so real sources wash out in the median).
+  thermal_requirements:
+    min_files: 10              # Minimum number of skysub files per (filter, dither_angle) group
+    min_positions: 3           # Minimum number of unique RA/DEC pointings
+    min_separation_arcsec: 10.0  # Two pointings are "different" only if separated by ≥ this [arcsec]
+
+# ============================================================================
+# GROUPING PARAMETERS (for sky subtraction)
+# ============================================================================
+grouping:
+  max_time_gap_hours: 9.0      # Max time gap between frames in same dither group [hours]
+
+# ============================================================================
+# SKY SUBTRACTION PARAMETERS
+# ============================================================================
+sky_subtraction:
+  central_fraction: 0.8        # Central region for median calculation (0.8 = inner 80%)
+  sigma_clip: 3.0              # Sigma clipping threshold for outlier rejection
+  noise_median_factor: 1.253   # Noise scaling for median combination (1.253 for Gaussian)
+
+# ============================================================================
+# ALIGNMENT PARAMETERS (dithering geometry)
+# ============================================================================
+alignment:
+  # Base angle offset for dithering pattern calculation
+  base_angle: 72                 # Base rotation offset added to dither angle [degrees]
+  
+  # Old system (pre-2025, uses DWANGLE keyword)
+  old:
+    dithangl_key: "DWANGLE"    # FITS keyword for dither angle
+    theta_offset: -72          # Rotation offset for old system [degrees]
+    theta_n: 5                 # Dither pattern rotation parameter [degrees]
+    r_n: 17                    # Dither step radius [pixels]
+  
+  # New system (post-2025, uses DITHANGL keyword)
+  new:
+    dithangl_key: "DITHANGL"   # FITS keyword for dither angle
+    theta_offset: 0            # Rotation offset for new system [degrees]
+    theta_n: 5                 # Dither pattern rotation parameter [degrees]
+    r_n: 17                    # Dither step radius [pixels]
+  
+  drizzle_pixfrac: 0.8          # Drizzle pixel fraction (1.0=full pixel, <1.0=shrink for sharper PSF)
+                               # 0.8 gives ~10% sharper PSF with minimal noise penalty
+  
+  # Optional alignment refinement (uses source detection & cross-matching)
+  refinement:
+    enabled: true              # Enable alignment refinement via cross-matching
+                               # If false or if refinement fails, falls back to blind dither geometry
+    
+    # Source detection for alignment
+    min_pixels: 5              # Minimum connected pixels above threshold
+    threshold_sigma: 2.0       # Detection threshold in sigma
+    max_sources: 50            # Cap to N brightest sources (avoids noise from faint sources)
+    
+    # Cross-matching and acceptance
+    pix_tol: 2.0               # Pixel tolerance for source matching [pixels]
+    min_matches: 4             # Min matched sources to accept refined shift
+    min_match_fraction: 0.15   # Min fraction of template sources that must match (15%)
+    accept_rms_px: 1.5         # Max RMS residual to accept refined solution [pixels]
+    
+    # Iterative refinement
+    n_refine_iters: 2          # Number of match-fit iterations (2 = re-match through fitted transform)
+    sigma_clip_iters: 3        # Sigma-clipping rounds inside each fit
+    sigma_clip_threshold: 3.0  # Reject matches > this many sigma
+    
+    # Fallback behavior
+    fallback_to_blind: true    # If true, use blind alignment when refinement fails
+                               # If false, skip alignment entirely on refinement failure
+
+# ============================================================================
+# SOURCE DETECTION PARAMETERS (for astrometry)
+# ============================================================================
+detection:
+  # Detection thresholds - tried in order until astrometry succeeds
+  min_pixels: [10, 5]          # Min connected pixels above threshold (stricter first)
+  threshold_sigma: [2.0, 1.2]  # Detection threshold in sigma (higher first)
+  
+  aperture_radius: 3.5         # Aperture radius for flux measurement [pixels]
+  margin_frac: 0.02            # Buffer zone OUTSIDE image for catalog matching
+                               # (allows sources slightly outside; 0.02 = ~9px for 450px image)
+  instrumental_zeropoint: 0.0  # Arbitrary zeropoint for instrumental magnitudes [mag]
+                               # Used for sorting sources by brightness (value doesn't affect results)
+  
+  # SEP (Source Extractor Python) background estimation
+  sep_bw: 128                  # Background mesh box width [pixels]
+  sep_bh: 128                  # Background mesh box height [pixels]
+  sep_fw: 2                    # Background filter width (smoothing)
+  sep_fh: 2                    # Background filter height (smoothing)
+  
+  # Iterative detection for crowded fields
+  n_iter: 3                    # Number of background iterations (1=single pass, 2+=iterative)
+  iter_mask_scale: 2.5         # Mask sources at this × ellipse size between iterations
+
+# ============================================================================
+# ASTROMETRY PARAMETERS
+# ============================================================================
+astrometry:
+  # Quality check - skip images with too few sources
+  min_sources: 3               # Min detected sources to attempt astrometry (< 3 = skip image)
+  
+  # Quad matching algorithm parameters
+  n_sources_detected: 25       # N brightest detected sources for quad building
+  n_sources_catalog: 25        # N brightest catalog sources for quad building
+  num_quads: 2500              # Max number of geometric quads to generate
+  threshold_code: 0.05         # Geometric hash similarity threshold (lower = stricter)
+  pix_tol: 2.0                 # Pixel tolerance for star-to-catalog matching [pixels]
+  
+  # Acceptance criteria
+  min_matches_rank: 3          # Min matched stars to consider a transform valid
+  min_match_fraction: 0.12     # Min fraction of detections that must match (primary criterion)
+  accept_rms_px: 1.5           # Max RMS residual to accept solution [pixels]
+  
+  # Output control
+  top_matches: 0               # Quad matches to evaluate (0 = use all matches)
+  print_best_only: true        # Only print best transformation (compact output)
+  top_groups_display: 5        # Number of top groups to show in verbose output
+  
+  # Consensus grouping - clusters similar transforms to find best solution
+  consensus:
+    # Binning for grouping similar transforms
+    scale_bin: 0.02            # Bin width for scale factor grouping
+    angle_bin: 0.5             # Bin width for rotation angle [degrees]
+    translation_bin: 5         # Bin width for translation [pixels]
+    
+    # Merge thresholds - combine nearby groups
+    merge_translation_px: 5.0  # Merge if translations within this [pixels]
+    merge_angle_deg: 1.0       # Merge if angles within this [degrees]
+    merge_scale: 0.02          # Merge if scales within this
+    
+    rank_rms_weight: 1.0       # Ranking: score = n_matches - weight × RMS
+  
+  # Scale constraints (enabled with -s flag)
+  scale_min: 0.95              # Minimum allowed scale factor
+  scale_max: 1.05              # Maximum allowed scale factor
+  
+  # 2MASS/VSX catalog query parameters
+  catalog:
+    grouping_tolerance_arcmin: 1.0  # Max separation to group images sharing same catalog [arcmin]
+                                    # Images within this tolerance use one catalog download
+    radius_arcmin: 10.0             # Cone search radius for catalog download [arcmin]
+                                    # Should be larger than image FOV to ensure full coverage
+    download_timeout: 30            # HTTP request timeout [seconds]
+    download_retries: 3              # Number of retry attempts on failure (with exponential backoff)
+    download_limit: 10000           # Max number of sources to retrieve per query
+    vsx_match_arcsec: 0.5           # Tolerance to cross-match VSX variables [arcsec]
+    default_mag: 99.0               # Placeholder for missing magnitudes
+    default_error: 0.4              # Default magnitude error when missing
+  
+  # WCS fitting
+  wcs_projection: 'TAN'        # Projection type (TAN = gnomonic, standard for small fields)
+  sip_degree: 2                # SIP distortion polynomial degree (2-3 for REMIR)
+  
+  # Fallback strategy - tries filters in order until success
+  filter_fallback:
+    J: ["J", "H"]              # For J-band: try J magnitudes, then H
+    K: ["K", "H"]              # For K-band: try K magnitudes, then H
+    H: ["H"]                   # For H-band: only H
+    H2: ["H"]                  # For H2 narrowband: use H
+    Z: ["H"]                   # For Z-band: use H (no 2MASS Z)
+    GRI: ["H"]                 # For optical: use H
+  
+  try_reflection: false         # Try mirror-flipped geometry if normal fails
+  skip_filters: ["GRISM", "H2"] # Filters to skip entirely (dispersed/non-imaging modes)
+                                # These coadds are copied to output without astrometry
+
+# ============================================================================
+# CO-ADDITION (STACKING)
+# ============================================================================
+coadd:
+  # Inverse-variance weighted mean of aligned frames
+  # coadd = Σ(data_i / σ_i²) / Σ(1 / σ_i²)
+  # noise = √(1 / Σ(1 / σ_i²))
+  # Pixel values at single-frame level; EXPTIME = total sum
+  # No configurable parameters
+
+# ============================================================================
+# PHOTOMETRIC CALIBRATION PARAMETERS
+# ============================================================================
+photometry:
+  enabled: true                # Enable photometric calibration after astrometry
+  
+  # Detection (fixed parameters, not tried in sequence like astrometry)
+  threshold_sigma: 1.2         # Detection threshold [sigma]
+  min_pixels: 5                # Minimum connected pixels
+  
+  # Aperture photometry - fixed radius
+  aperture_radius: 3.0         # Fixed aperture radius [pixels]
+  
+  # Source filtering for calibration stars
+  central_fraction: 0.90       # Only use sources in central 90% of image
+  min_isolation_dist: 8.0      # Min separation between sources [pixels]
+                               # (rejects blended/crowded stars; should be > 2× max aperture)
+  
+  # Catalog matching
+  match_tolerance: 2.0         # Max distance to match detection to catalog [pixels]
+  
+  # Zeropoint fitting with outlier rejection
+  sigma_clip: 3.0              # Sigma clipping for outlier rejection
+  max_iterations: 10           # Max iterations for iterative clipping
+  min_calibration_stars: 3     # Min stars required for valid calibration
+  max_inst_mag_err: 0.2        # Max instrumental mag error (rejects faint/noisy)
+  target_rms: 0.2              # Target RMS - stop clipping when reached [mag]
+  
+  # Filters with 2MASS calibration available
+  calibrate_filters: ['J', 'H', 'K']  # Skip Z, GRI, H2 (no 2MASS data)
+  
+  # Standard star validation (PROCTYPE=1 observations)
+  standard_check_tolerance_arcsec: 40.0  # Matching tolerance for standard stars
+  
+  # Quality classification thresholds
+  quality_thresholds:
+    # RMS of zeropoint fit [mag]
+    rms:
+      very_good: 0.1           # RMS < 0.1 mag
+      good: 0.175              # RMS < 0.175 mag
+      medium: 0.25             # RMS < 0.25 mag
+      poor: 0.35               # RMS < 0.35 mag (>= poor = VERY POOR)
+    
+    # Fraction of rejected calibration stars
+    rejection:
+      good: 0.25               # < 25% rejected
+      medium: 0.50             # < 50% rejected (>= medium = POOR)
+    
+    # Zeropoint comparison (standard vs field stars) [mag]
+    zp_comparison:
+      very_good: 0.05          # |diff| < 0.05 mag
+      good: 0.1                # |diff| < 0.1 mag
+      medium: 0.2              # |diff| < 0.2 mag (>= medium = POOR)
+
+# ============================================================================
+# PREVIEW GENERATION (optional JPG output)
+# ============================================================================
+preview:
+  enabled: false               # Generate JPG previews of reduced images
+  colormap: 'Greys'            # Matplotlib colormap
+  invert: true                 # Invert colormap (true = black stars on white)
+  dpi: 100                     # Output resolution [dots per inch]
+  figsize: [8, 8]              # Figure size [width, height] in inches
+  title_fontsize: 14           # Filename title font size
+  
+  # Image scaling based on central region statistics
+  use_central_stats: true      # Compute vmin/vmax from central region only
+  central_fraction: 0.8        # Central region for statistics (0.8 = inner 80%)
+  vmin_sigma: -0.5             # vmin = median + vmin_sigma × sigma
+  vmax_sigma: 4.0              # vmax = median + vmax_sigma × sigma
+
