@@ -11,7 +11,6 @@ import heapq
 import itertools
 import logging
 import os
-import re
 import shutil
 import sys
 import time
@@ -32,14 +31,14 @@ import yaml
 from astropy import units as u
 from astropy.coordinates import SkyCoord
 from astropy.io import fits
-from astropy.stats import sigma_clipped_stats, sigma_clip
+from astropy.stats import sigma_clipped_stats
 from astropy.table import Table
 from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import fit_wcs_from_points
 from photutils.aperture import CircularAperture, aperture_photometry
-from scipy.ndimage import shift, median_filter, generic_filter
 from scipy.spatial import cKDTree
+from scipy.spatial.distance import cdist
 
 # Global statistics to collect pipeline-wide counts
 STATS = defaultdict(int)
@@ -1254,24 +1253,212 @@ def validate_groups(groups, verbose=False):
     return valid_groups, incomplete_groups, defective_groups
 
 
+def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir, verbose=False):
+    """Apply thermal residual correction to sky-subtracted files.
+    
+    The thermal pattern scales linearly with exposure time.  We build a
+    template at a reference exposure (10 s) and subtract it scaled by each
+    file's actual EXPTIME.
+    
+    Algorithm (per filter, dither_angle group):
+    1. Collect all skysub files for this (filter, dither_angle)
+    2. Scale every file to 10 s equivalent: data_scaled = data × (10 / EXPTIME)
+    3. Create thermal template = median(data_scaled)  → pattern at 10 s
+    4. Zero-centre the template (remove sky offset)
+    5. For each file compute α = EXPTIME / 10
+    6. Apply: corrected = data − α × template
+    7. Update file in place (overwrite)
+    
+    Args:
+        skysub_files_by_group: List of tuples (group_key, skysub_files) where
+                               group_key = (object, filter, obsid, subid)
+                               skysub_files = list of dicts with 'path', 'data', 'noise', 'header'
+        config: Pipeline configuration dictionary
+        output_dir: Directory where skysub files are stored
+        verbose: Enable verbose logging
+    
+    Returns:
+        int: Number of files corrected
+    """
+    enable_thermal = config.get('calibration', {}).get('enable_thermal_correction', True)
+    thermal_filters = config.get('calibration', {}).get('thermal_filters', ['J', 'H', 'K', 'Z'])
+    THERMAL_REF_EXPTIME = 10.0  # Reference exposure time [seconds]
+
+    # Thermal diversity requirements from config
+    thermal_cfg = config.get('calibration', {}).get('thermal_requirements', {})
+    min_files_thermal = thermal_cfg.get('min_files', 10)
+    min_positions_thermal = thermal_cfg.get('min_positions', 3)
+    min_separation_arcsec = thermal_cfg.get('min_separation_arcsec', 10.0)
+
+    if not enable_thermal:
+        if verbose:
+            logging.info("  Thermal residual correction disabled in config")
+        return 0
+    
+    if verbose:
+        logging.info("")
+        logging.info("Applying thermal residual correction...")
+    
+    # Group all skysub files by (filter, dither_angle)
+    from collections import defaultdict
+    grouped = defaultdict(list)
+    
+    for group_key, skysub_files in skysub_files_by_group:
+        filt = group_key[1]  # (object, filter, obsid, subid)
+        
+        if filt not in thermal_filters:
+            continue
+        
+        for sf in skysub_files:
+            header = sf['header']
+            
+            # Get dither angle
+            if 'DITHANGL' in header:
+                dither_angle = header['DITHANGL']
+            elif 'DWANGLE' in header:
+                dither_angle = (header['DWANGLE'] - 72.0) % 360
+            else:
+                dither_angle = 0.0
+            
+            dither_angle_rounded = int(round(dither_angle / 72.0) * 72) % 360
+            thermal_key = (filt, dither_angle_rounded)
+            
+            grouped[thermal_key].append(sf)
+    
+    total_corrected = 0
+    
+    for (filt, dither_angle), files in grouped.items():
+        if len(files) < min_files_thermal:
+            if verbose:
+                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: only {len(files)} files (need ≥{min_files_thermal})")
+            continue
+
+        # --- RA/DEC diversity check ---------------------------------------------------
+        # Collect unique pointings and verify they are sufficiently separated.
+        positions = []
+        for sf in files:
+            ra_val = sf['header'].get('RA', None)
+            dec_val = sf['header'].get('DEC', None)
+            if ra_val is not None and dec_val is not None:
+                try:
+                    positions.append((float(ra_val), float(dec_val)))
+                except (ValueError, TypeError):
+                    pass
+
+        if not positions:
+            if verbose:
+                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: no RA/DEC in headers")
+            continue
+
+        # Cluster positions: two pointings are "the same" if < min_separation_arcsec apart
+        unique_positions = [positions[0]]
+        for ra_i, dec_i in positions[1:]:
+            coord_i = SkyCoord(ra=ra_i, dec=dec_i, unit='deg')
+            is_new = True
+            for ra_u, dec_u in unique_positions:
+                coord_u = SkyCoord(ra=ra_u, dec=dec_u, unit='deg')
+                if coord_i.separation(coord_u).arcsec < min_separation_arcsec:
+                    is_new = False
+                    break
+            if is_new:
+                unique_positions.append((ra_i, dec_i))
+
+        if len(unique_positions) < min_positions_thermal:
+            if verbose:
+                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: only {len(unique_positions)} "
+                             f"unique positions (need ≥{min_positions_thermal}, separation ≥{min_separation_arcsec}\"")
+            continue
+        
+        # Build template at reference exposure (10 s):
+        # scale every file to 10 s equivalent, then take the median.
+        scaled_stack = []
+        for sf in files:
+            if 'data' in sf and sf['data'] is not None:
+                data_i = sf['data']
+            else:
+                with fits.open(sf['path']) as hdul:
+                    data_i = hdul[0].data.astype(np.float32)
+            
+            exptime = sf['header'].get('EXPTIME', THERMAL_REF_EXPTIME)
+            if exptime <= 0:
+                exptime = THERMAL_REF_EXPTIME
+            scale_factor = THERMAL_REF_EXPTIME / exptime
+            scaled_stack.append(data_i * scale_factor)
+        
+        # Thermal template at 10 s equivalent
+        template = np.nanmedian(np.array(scaled_stack), axis=0)
+        
+        # Zero-centre (remove any residual sky offset so we only subtract the pattern)
+        template_centered = template - np.nanmedian(template)
+        
+        if verbose:
+            logging.info(f"  Created thermal template for {filt} dither{dither_angle:03d} "
+                        f"from {len(files)} files (ref={THERMAL_REF_EXPTIME}s)")
+        
+        # Apply correction to each file: α = EXPTIME / 10
+        for i, sf in enumerate(files):
+            if 'data' in sf and sf['data'] is not None:
+                data = sf['data']
+            else:
+                with fits.open(sf['path']) as hdul:
+                    data = hdul[0].data.astype(np.float32)
+            
+            # Ensure noise is loaded in memory for subsequent pipeline steps
+            if 'noise' not in sf or sf['noise'] is None:
+                with fits.open(sf['path']) as hdul:
+                    if len(hdul) > 1 and hdul[1].name == 'NOISE':
+                        sf['noise'] = hdul[1].data.astype(np.float32)
+                    else:
+                        sf['noise'] = np.sqrt(np.abs(data))
+            
+            exptime = sf['header'].get('EXPTIME', THERMAL_REF_EXPTIME)
+            if exptime <= 0:
+                exptime = THERMAL_REF_EXPTIME
+            alpha = exptime / THERMAL_REF_EXPTIME
+            
+            # Apply correction: corrected = data − α × template_10s
+            data_corrected = data - alpha * template_centered
+            
+            # Update in memory
+            sf['data'] = data_corrected
+            
+            # Update file on disk
+            with fits.open(sf['path'], mode='update') as hdul:
+                hdul[0].data = data_corrected
+                hdul[0].header['HISTORY'] = (f'Thermal correction: alpha={alpha:.4f} '
+                                             f'(EXPTIME={exptime:.1f}s / ref={THERMAL_REF_EXPTIME:.0f}s)')
+                hdul[0].header['THMALPHA'] = (alpha, 'Thermal correction scaling (EXPTIME/ref)')
+                hdul.flush()
+            
+            total_corrected += 1
+        
+        if verbose:
+            logging.info(f"    Corrected {len(files)} files for {filt} dither{dither_angle:03d}")
+    
+    if verbose:
+        logging.info(f"  Total thermal corrections applied: {total_corrected}")
+    
+    return total_corrected
+
+
 def process_group_sky_subtraction(group, config, output_dir, verbose=False):
-    """Perform flat field correction and sky subtraction on a dither group.
+    """Perform sky subtraction and flat field correction on a dither group.
     
-    Workflow (if calibration files available):
-    1. Load flat for this filter+dither from data_folder
-    2. For each file:
-       a) Apply: data_corrected = data / flat
-       b) Bad pixels already masked by pixel_mask.fits
-    3. Compute sky from corrected frames (normalized by median)
-    4. Subtract sky
+    SIMPLIFIED WORKFLOW:
+    1. Load raw masked frames (pixel mask already applied in file prep)
+    2. Level normalization: compute median of central 80% for each frame,
+       then scale all frames so medians equal the mean of all medians
+    3. Create single sky from median of all N leveled frames
+    4. Sky subtract and flat field: (raw - sky) / flat
     
-    Thermal pattern correction is applied separately after this step
-    by apply_thermal_correction().
+    Thermal correction is now done AFTER this step, using the skysub files.
     
     Noise propagation:
-    - Input noise = sqrt(data/gain + read_noise^2) / flat
-    - Sky noise = median_factor * sqrt(sum(sky_noise^2)) / n_frames
-    - Output noise = sqrt(input_noise^2 + sky_noise^2)
+    - Input noise = sqrt(data_raw/gain + (read_noise/gain)^2)  [all in ADU]
+    - After leveling: noise *= scale_factor (tracks data units)
+    - Sky noise = median_factor * sqrt(sum(leveled_noise^2)) / N_eff
+    - After sky subtraction: sqrt(leveled_noise^2 + sky_noise^2)
+    - After flat division: final_noise / flat
     
     Args:
         group: Dict with 'files' list and 'key' tuple (object, filter, obsid, subid)
@@ -1296,8 +1483,9 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
     gain = config['detector']['gain']
     read_noise = config['detector']['read_noise']
     
-    # ========== STEP 1: SETUP CALIBRATION ==========
+    # ========== STEP 1: SETUP ==========
     enable_flat = config.get('calibration', {}).get('enable_flat_correction', True)
+    
     script_dir = os.path.dirname(os.path.abspath(__file__))
     data_folder_rel = config['paths'].get('data_folder', 'data')
     data_folder = os.path.join(script_dir, data_folder_rel)
@@ -1306,21 +1494,98 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
     sky_central_fraction = config['sky_subtraction']['central_fraction']
     sky_sigma_clip = config['sky_subtraction']['sigma_clip']
     
-    # ========== STEP 2: APPLY CALIBRATION TO EACH FILE ==========
-    # Each file may have a different dither angle, so load appropriate flat for each
+    # ========== STEP 2: LOAD RAW DATA (pixel mask already applied) ==========
     data_list = []
     noise_list = []
     headers = []
-    
-    # Cache loaded flats to avoid reloading the same file
-    flat_cache = {}
     
     for file_info in files:
         with fits.open(file_info['path']) as hdul:
             data_raw = hdul[0].data.astype(np.float32)
             header = hdul[0].header.copy()
         
-        # Get dither angle for THIS file
+        # Initial noise (all in ADU²)
+        # Variance = data_raw/gain + (RON/gain)^2
+        variance = data_raw / gain + (read_noise / gain)**2
+        noise_initial = np.sqrt(variance)
+        
+        # Handle non-finite values
+        noise_initial[~np.isfinite(data_raw)] = np.nan
+        
+        data_list.append(data_raw)
+        noise_list.append(noise_initial)
+        headers.append(header)
+    
+    # ========== STEP 3: LEVEL NORMALIZATION ==========
+    # Compute median of central 80% for each frame
+    medians = []
+    for data in data_list:
+        central = get_central_region(data, sky_central_fraction)
+        med = sigma_clipped_median(central, sigma=sky_sigma_clip)
+        medians.append(med)
+    
+    # Scale all frames so medians equal the mean of all medians
+    mean_median = np.mean(medians)
+    data_leveled = []
+    noise_leveled = []
+    for data, noise, med in zip(data_list, noise_list, medians):
+        if med > 0:
+            scale_factor = mean_median / med
+            data_leveled.append(data * scale_factor)
+            noise_leveled.append(noise * scale_factor)
+        else:
+            data_leveled.append(data.copy())
+            noise_leveled.append(noise.copy())
+    
+    if verbose:
+        logging.info(f"    Leveled {len(data_leveled)} frames to mean median={mean_median:.1f}")
+    
+    # ========== STEP 4: CREATE SINGLE SKY FROM ALL N FRAMES ==========
+    data_stack = np.array(data_leveled)
+    sky_pattern = np.nanmedian(data_stack, axis=0)
+    
+    # Sky noise (using all N frames)
+    noise_stack = np.array(noise_leveled)
+    var_stack = np.nansum(noise_stack**2, axis=0)
+    N_eff = np.sum(np.isfinite(data_stack), axis=0)
+    N_eff[N_eff == 0] = 1
+    noise_sky = config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_stack) / N_eff
+    
+    # Save sky pattern
+    sky_filename = f"{group_name}_sky.fits"
+    sky_path = os.path.join(output_dir, sky_filename)
+    
+    sky_header = headers[0].copy()
+    sky_header['DITHID'] = config['fits_markers']['dithid_sky']
+    sky_header['PROCSTAT'] = config['fits_markers']['procstat_reduced']
+    sky_header['PSTATSUB'] = config['fits_markers']['pstatsub_sky']
+    sky_header['FILENAME'] = sky_filename
+    sky_header['DATE'] = format_date_like_dateobs(headers[0]['DATE-OBS'])
+    sky_header['HISTORY'] = f"Sky from median of {len(files)} leveled frames"
+    sky_header['HISTORY'] = f"Leveling: scaled to mean median={mean_median:.1f}"
+    
+    fits.writeto(sky_path, sky_pattern, sky_header, overwrite=True)
+    STATS['sky_frames'] += 1
+    
+    if verbose:
+        logging.info(f"    Created single sky pattern from {len(files)} frames")
+    
+    # ========== STEP 5: SKY SUBTRACTION + FLAT FIELD ==========
+    # Formula: (raw_leveled - sky) / flat
+    # Note: flat division done AFTER sky subtraction (standard practice)
+    skysub_files = []
+    
+    # Cache loaded flats to avoid reloading
+    flat_cache = {}
+    
+    for i, (data_lev, noise_in, file_info, header) in enumerate(
+            zip(data_leveled, noise_leveled, files, headers)):
+        
+        # Sky subtract
+        data_skysub = data_lev - sky_pattern
+        noise_skysub = np.sqrt(noise_in**2 + noise_sky**2)
+        
+        # Get dither angle for flat field loading
         if 'DITHANGL' in header:
             dither_angle = header['DITHANGL']
         elif 'DWANGLE' in header:
@@ -1328,7 +1593,6 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         else:
             dither_angle = 0.0
         
-        # Round to nearest expected angle for file lookup
         dither_angle_rounded = int(round(dither_angle / 72.0) * 72) % 360
         
         # Load flat for this dither position (cached)
@@ -1345,91 +1609,14 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         
         # Fallback to unity flat
         if flat is None:
-            if verbose and not hasattr(file_info, '_unity_warned'):
-                if not enable_flat:
-                    logging.info(f"  Flat correction disabled, using unity flat")
-                else:
-                    logging.info(f"  No flat for {filt}@{dither_angle_rounded}°, using unity")
-            flat = np.ones_like(data_raw)
+            flat = np.ones_like(data_skysub)
         
-        # Apply flat field correction
-        # Formula: data_corrected = data / flat
-        data_corrected = data_raw / flat
+        # Apply flat field correction AFTER sky subtraction
+        data_final = data_skysub / flat
+        noise_final = noise_skysub / flat
         
-        # Propagate noise: sqrt((data_raw/gain + RON^2) / flat^2)
-        variance = data_raw / gain + read_noise**2
-        noise_corrected = np.sqrt(variance) / flat
-        
-        # Handle non-finite values (bad pixels already masked by pixel_mask.fits)
-        noise_corrected[~np.isfinite(data_corrected)] = np.nan
-        
-        data_list.append(data_corrected)
-        noise_list.append(noise_corrected)
-        headers.append(header)
-
-    
-    # ========== STEP 3: COMPUTE SKY FROM CORRECTED FRAMES ==========
-    # Calculate sigma-clipped medians of central region for each frame
-    # We subtract individual sky levels first (leveling), then combine
-    medians = []
-    for data in data_list:
-        central = get_central_region(data, sky_central_fraction)
-        med = sigma_clipped_median(central, sigma=sky_sigma_clip)
-        medians.append(med)
-    
-    # Level frames by subtracting individual sky levels (preserves source flux)
-    data_leveled = [d - med for d, med in zip(data_list, medians)]
-    # Noise unchanged by constant subtraction
-    noise_leveled = noise_list
-    
-    # Create sky pattern from leveled frames (should be ~zero-centered)
-    data_stack = np.array(data_leveled)
-    noise_stack = np.array(noise_leveled)
-    
-    # Sky pattern is the residual structure after leveling
-    sky_pattern = np.nanmedian(data_stack, axis=0)
-    
-    # Replace NaN in sky_pattern with 0 (pixels that are NaN in all frames)
-    # This is reasonable since sky_pattern is zero-centered after leveling
-    sky_pattern = np.nan_to_num(sky_pattern, nan=0.0)
-    
-    # Noise of sky pattern
-    var_stack = np.nansum(noise_stack**2, axis=0)
-    N_eff = np.sum(np.isfinite(data_stack), axis=0)
-    N_eff[N_eff == 0] = 1  # Avoid division by zero
-    noise_sky = config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_stack) / N_eff
-    
-    # Save sky pattern frame
-    sky_filename = f"{group_name}_sky.fits"
-    sky_path = os.path.join(output_dir, sky_filename)
-    
-    sky_header = headers[0].copy()
-    sky_header['DITHID'] = config['fits_markers']['dithid_sky']
-    sky_header['PROCSTAT'] = config['fits_markers']['procstat_reduced']
-    sky_header['PSTATSUB'] = config['fits_markers']['pstatsub_sky']
-    sky_header['FILENAME'] = sky_filename
-    sky_header['DATE-OBS'] = average_date_obs([h['DATE-OBS'] for h in headers])
-    
-    exptimes = [h.get('EXPTIME', 0) for h in headers]
-    sky_header['EXPTIME'] = np.mean(exptimes)
-    if not np.allclose(exptimes, exptimes[0]):
-        logging.warning(f"  Group {group_name}: EXPTIME values not consistent: {exptimes}")
-    
-    sky_header['DATE'] = format_date_like_dateobs(sky_header['DATE-OBS'])
-    sky_header['HISTORY'] = f"Sky pattern from {len(files)} leveled frames"
-    sky_header['HISTORY'] = f"Individual sky levels subtracted: {[f'{m:.1f}' for m in medians]}"
-    
-    fits.writeto(sky_path, sky_pattern, sky_header, overwrite=True)
-    # Count sky frames created
-    STATS['sky_frames'] += 1
-    
-    # Create sky-subtracted frames
-    # Final frame = original - individual_sky_level - sky_pattern = leveled - sky_pattern
-    skysub_files = []
-    
-    for i, (data_lev, noise_lev, file_info, header) in enumerate(zip(data_leveled, noise_leveled, files, headers)):
-        data_sub = data_lev - sky_pattern
-        noise_sub = np.sqrt(noise_lev**2 + noise_sky**2)
+        # Handle non-finite values
+        noise_final[~np.isfinite(data_final)] = np.nan
         
         skysub_filename = file_info['file'].replace('.fits', '_skysub.fits')
         skysub_path = os.path.join(output_dir, skysub_filename)
@@ -1439,363 +1626,149 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         skysub_header['PSTATSUB'] = config['fits_markers']['pstatsub_skysub']
         skysub_header['FILENAME'] = skysub_filename
         skysub_header['DATE'] = format_date_like_dateobs(header['DATE-OBS'])
-        skysub_header['HISTORY'] = f"Sky subtracted using {sky_filename}"
+        skysub_header['HISTORY'] = f"Sky subtracted (median of {len(files)} frames)"
+        skysub_header['HISTORY'] = f"Flat fielded after sky subtraction"
+        skysub_header['COMMENT'] = "Processing order: level -> sky -> flat"
         
         # Save data and noise as extensions
-        primary_hdu = fits.PrimaryHDU(data_sub, header=skysub_header)
-        noise_hdu = fits.ImageHDU(noise_sub, name='NOISE')
+        primary_hdu = fits.PrimaryHDU(data_final, header=skysub_header)
+        noise_hdu = fits.ImageHDU(noise_final, name='NOISE')
         hdul = fits.HDUList([primary_hdu, noise_hdu])
         hdul.writeto(skysub_path, overwrite=True)
         
         skysub_files.append({
             'file': skysub_filename,
             'path': skysub_path,
-            'data': data_sub,
-            'noise': noise_sub,
+            'data': data_final,
+            'noise': noise_final,
             'header': skysub_header
         })
     
     return sky_path, skysub_files, group_name
 
 
-def get_dither_angle_from_header(header):
-    """Extract dither angle from header, handling old/new systems.
-    
-    Returns rounded angle (0, 72, 144, 216, 288) for grouping.
-    """
-    if 'DITHANGL' in header:
-        angle = header['DITHANGL']
-    elif 'DWANGLE' in header:
-        # Old system: convert to new system equivalent
-        angle = (header['DWANGLE'] - 72.0) % 360
-    else:
-        angle = 0.0
-    # Round to nearest expected angle
-    return int(round(angle / 72.0) * 72) % 360
+# ============================================================================
+# ALIGNMENT AND GEOMETRY UTILITIES
+# ============================================================================
 
+def _fit_similarity_transform(src_coords, dst_coords, weights=None,
+                              sigma_clip_iters=3, sigma_clip_threshold=3.0):
+    """Fit a 2D similarity transform with optional flux weighting and sigma-clipping.
 
-def apply_thermal_correction(skysub_files, config, output_dir, verbose=False):
-    """Apply thermal pattern correction to sky-subtracted frames.
-    
-    The thermal pattern from the warm dither wedge is additive and scales
-    linearly with exposure time. This function supports two modes:
-    
-    1. Static templates (thermal_use_static=true):
-       Loads pre-computed templates from data_folder:
-       {FILTER}_dither{ANGLE}_exptime{SEC}_thermal.fits
-       
-    2. Dynamic templates (thermal_use_static=false):
-       Builds templates from same-night data by sigma-clipped median stacking
-       For exposure times with <min_frames, interpolates from other exptimes
-    
+    Finds the best-fit transform mapping src -> dst:
+        x_dst = a * x_src - b * y_src + tx
+        y_dst = b * x_src + a * y_src + ty
+
+    where a = s*cos(theta), b = s*sin(theta), s = scale, theta = rotation angle.
+
+    Iteratively sigma-clips outlier matches and applies flux-based weights
+    for sub-pixel precision.
+
     Args:
-        skysub_files: List of dicts with 'data', 'noise', 'header', 'path', 'file'
-        config: Pipeline configuration dictionary
-        output_dir: Directory to write thermal-corrected files
-        verbose: Enable verbose logging
-    
+        src_coords: Nx2 array of source (x, y) coordinates
+        dst_coords: Nx2 array of destination (x, y) coordinates
+        weights: Optional Nx1 array of per-match weights (e.g. sqrt(flux)).
+                 If None, all matches weighted equally.
+        sigma_clip_iters: Number of sigma-clipping iterations (0 = no clipping)
+        sigma_clip_threshold: Reject matches with residual > this many sigma
+
     Returns:
-        list: Updated skysub_files with thermal-corrected data
+        dict with keys: a, b, tx, ty, rotation_deg, scale, rms, n_used, inlier_mask
     """
-    calib_cfg = config.get('calibration', {})
-    enabled = calib_cfg.get('enable_thermal_correction', True)
-    use_static = calib_cfg.get('thermal_use_static', False)
-    min_frames = calib_cfg.get('thermal_min_frames', 10)
-    
-    if not enabled:
-        if verbose:
-            logging.info("  Thermal correction disabled")
-        return skysub_files
-    
-    if verbose:
-        logging.info("  Applying thermal pattern correction...")
-    
-    # Collect unique filter × dither × exptime combinations needed
-    frame_keys = []
-    for f in skysub_files:
-        header = f['header']
-        filt = header.get('FILTER', 'UNK').strip().upper()
-        dither = get_dither_angle_from_header(header)
-        exptime = round(header.get('EXPTIME', 1.0), 2)
-        frame_keys.append((filt, dither, exptime))
-    
-    thermal_templates = {}  # (filt, dither, exptime) -> template
-    
-    # ========== MODE 1: STATIC TEMPLATES ==========
-    if use_static:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        data_folder_rel = config['paths'].get('data_folder', 'data')
-        data_folder = os.path.join(script_dir, data_folder_rel)
-        
-        # Pattern: {FILTER}_dither{ANGLE}_exptime{SEC}_thermal.fits
-        thermal_pattern = re.compile(r'^([JHK])_dither(\d+)_exptime(\d+)_thermal\.fits$')
-        
-        available_templates = {}  # (filt, dither) -> [(exptime, template_data), ...]
-        
-        if os.path.exists(data_folder):
-            for fname in os.listdir(data_folder):
-                match = thermal_pattern.match(fname)
-                if match:
-                    filt_t = match.group(1)
-                    dither_t = int(match.group(2))
-                    exptime_t = int(match.group(3))
-                    
-                    template_path = os.path.join(data_folder, fname)
-                    template_data = fits.getdata(template_path).astype(np.float32)
-                    
-                    key = (filt_t, dither_t)
-                    if key not in available_templates:
-                        available_templates[key] = []
-                    available_templates[key].append((exptime_t, template_data))
-                    
-                    if verbose:
-                        logging.info(f"    Found static thermal: {fname}")
-        
-        # Sort by exptime for each filter×dither
-        for key in available_templates:
-            available_templates[key].sort(key=lambda x: x[0])
-        
-        if verbose:
-            logging.info(f"    Available thermal templates: {list(available_templates.keys())}")
-        
-        # For each unique frame key, find or interpolate the appropriate template
-        unique_keys = set(frame_keys)
-        
-        for (filt, dither, exptime) in unique_keys:
-            key = (filt, dither)
-            
-            if key not in available_templates or len(available_templates[key]) == 0:
-                # No templates for this filter×dither
-                thermal_templates[(filt, dither, exptime)] = None
-                if verbose:
-                    logging.info(f"    {filt}@{dither}° {exptime}s: no templates available")
-                continue
-            
-            templates_list = available_templates[key]  # [(exptime, data), ...]
-            ref_exptimes = [t[0] for t in templates_list]
-            ref_data = [t[1] for t in templates_list]
-            
-            # Check for exact match first
-            exact_match = None
-            for i, t in enumerate(ref_exptimes):
-                if abs(t - exptime) < 0.5:  # Within 0.5s tolerance
-                    exact_match = i
-                    break
-            
-            if exact_match is not None:
-                thermal_templates[(filt, dither, exptime)] = ref_data[exact_match]
-                if verbose:
-                    logging.info(f"    {filt}@{dither}° {exptime}s: exact match at {ref_exptimes[exact_match]}s")
-            elif len(templates_list) == 1:
-                # Only one template, scale linearly
-                ref_t = ref_exptimes[0]
-                scale = exptime / ref_t
-                thermal_templates[(filt, dither, exptime)] = ref_data[0] * scale
-                if verbose:
-                    logging.info(f"    {filt}@{dither}° {exptime}s: scaled from {ref_t}s (×{scale:.2f})")
-            else:
-                # Multiple templates: interpolate or extrapolate
-                if exptime < ref_exptimes[0]:
-                    # Extrapolate below minimum
-                    scale = exptime / ref_exptimes[0]
-                    thermal_templates[(filt, dither, exptime)] = ref_data[0] * scale
-                    if verbose:
-                        logging.info(f"    {filt}@{dither}° {exptime}s: extrapolated from {ref_exptimes[0]}s (×{scale:.2f})")
-                elif exptime > ref_exptimes[-1]:
-                    # Extrapolate above maximum
-                    scale = exptime / ref_exptimes[-1]
-                    thermal_templates[(filt, dither, exptime)] = ref_data[-1] * scale
-                    if verbose:
-                        logging.info(f"    {filt}@{dither}° {exptime}s: extrapolated from {ref_exptimes[-1]}s (×{scale:.2f})")
-                else:
-                    # Interpolate between two nearest
-                    for i in range(len(ref_exptimes) - 1):
-                        if ref_exptimes[i] <= exptime <= ref_exptimes[i+1]:
-                            t1, t2 = ref_exptimes[i], ref_exptimes[i+1]
-                            w = (exptime - t1) / (t2 - t1)
-                            thermal_templates[(filt, dither, exptime)] = (
-                                ref_data[i] * (1 - w) + ref_data[i+1] * w
-                            )
-                            if verbose:
-                                logging.info(f"    {filt}@{dither}° {exptime}s: interpolated between {t1}s and {t2}s (w={w:.2f})")
-                            break
-    
-    # ========== MODE 2: DYNAMIC TEMPLATES ==========
+    N = len(src_coords)
+    xs, ys = src_coords[:, 0], src_coords[:, 1]
+    xd, yd = dst_coords[:, 0], dst_coords[:, 1]
+
+    if weights is None:
+        w = np.ones(N)
     else:
-        if len(skysub_files) < 3:
-            if verbose:
-                logging.info("  Too few frames for dynamic thermal correction, skipping")
-            return skysub_files
-        
-        # Group frames by filter × dither × exptime
-        groups = defaultdict(list)
-        for idx, f in enumerate(skysub_files):
-            header = f['header']
-            filt = header.get('FILTER', 'UNK').strip().upper()
-            dither = get_dither_angle_from_header(header)
-            exptime = round(header.get('EXPTIME', 1.0), 2)
-            key = (filt, dither, exptime)
-            groups[key].append((idx, f))
-        
-        # Build thermal templates for each filter × dither combination
-        # Collect all exptimes per filter × dither
-        # Mask sources in each frame before stacking to avoid stellar contamination
-        filter_dither_data = defaultdict(lambda: defaultdict(list))
-        for (filt, dither, exptime), frames in groups.items():
-            for idx, f in frames:
-                data = f['data'].copy()
-                
-                # Detect and mask sources with SEP
-                data_bkg = (data - np.nanmedian(data)).astype(np.float32)
-                data_sep = np.ascontiguousarray(data_bkg)
-                
-                try:
-                    bkg = sep.Background(data_sep)
-                    data_sub = data_sep - bkg
-                    objects = sep.extract(data_sub, thresh=3.0, err=bkg.globalrms)
-                    
-                    # Mask sources (circles of radius 5 pixels)
-                    for obj in objects:
-                        y, x = int(obj['y']), int(obj['x'])
-                        r = 5
-                        yy, xx = np.ogrid[-r:r+1, -r:r+1]
-                        circle = xx**2 + yy**2 <= r**2
-                        y0, y1 = max(0, y-r), min(data.shape[0], y+r+1)
-                        x0, x1 = max(0, x-r), min(data.shape[1], x+r+1)
-                        data[y0:y1, x0:x1][circle[:y1-y0, :x1-x0]] = np.nan
-                except Exception:
-                    pass  # If SEP fails, use original data
-                
-                filter_dither_data[(filt, dither)][exptime].append((idx, data))
-        
-        # For each filter × dither, build thermal templates per exptime
-        for (filt, dither), exptime_data in filter_dither_data.items():
-            exptimes_available = sorted(exptime_data.keys())
-            
-            if verbose:
-                logging.info(f"    {filt} @ {dither}°: exptimes = {exptimes_available}")
-            
-            # Build templates for exptimes with enough frames
-            templates_by_exptime = {}
-            for exptime in exptimes_available:
-                frames_list = exptime_data[exptime]
-                if len(frames_list) >= min_frames:
-                    # Stack with nanmedian (ignores masked sources)
-                    cube = np.array([f[1] for f in frames_list])
-                    template = np.nanmedian(cube, axis=0).astype(np.float32)
-                    
-                    # Fill NaN pixels with local median interpolation
-                    nan_mask = np.isnan(template)
-                    if nan_mask.any():
-                        filled = generic_filter(
-                            np.where(nan_mask, 0, template),
-                            np.nanmedian, size=11
-                        )
-                        template[nan_mask] = filled[nan_mask]
-                    
-                    templates_by_exptime[exptime] = template
-                    
-                    if verbose:
-                        logging.info(f"      {exptime}s: built template from {len(frames_list)} frames (sources masked)")
-                else:
-                    if verbose:
-                        logging.info(f"      {exptime}s: only {len(frames_list)} frames, will interpolate")
-            
-            # Interpolate for exptimes without enough frames
-            if len(templates_by_exptime) == 0:
-                if verbose:
-                    logging.info(f"      No valid templates for {filt}@{dither}°")
-                for exptime in exptimes_available:
-                    thermal_templates[(filt, dither, exptime)] = None
-            elif len(templates_by_exptime) == 1:
-                # Only one template, scale linearly for other exptimes
-                ref_exptime, ref_template = list(templates_by_exptime.items())[0]
-                for exptime in exptimes_available:
-                    if exptime in templates_by_exptime:
-                        thermal_templates[(filt, dither, exptime)] = templates_by_exptime[exptime]
-                    else:
-                        # Scale linearly: thermal ∝ exptime
-                        scale = exptime / ref_exptime
-                        thermal_templates[(filt, dither, exptime)] = ref_template * scale
-                        if verbose:
-                            logging.info(f"      {exptime}s: scaled from {ref_exptime}s (factor {scale:.2f})")
-            else:
-                # Multiple templates: interpolate pixel-by-pixel
-                sorted_ref_exptimes = sorted(templates_by_exptime.keys())
-                ref_templates = [templates_by_exptime[t] for t in sorted_ref_exptimes]
-                
-                for exptime in exptimes_available:
-                    if exptime in templates_by_exptime:
-                        thermal_templates[(filt, dither, exptime)] = templates_by_exptime[exptime]
-                    else:
-                        # Linear interpolation between nearest exptimes
-                        if exptime < sorted_ref_exptimes[0]:
-                            # Extrapolate from lowest
-                            scale = exptime / sorted_ref_exptimes[0]
-                            thermal_templates[(filt, dither, exptime)] = ref_templates[0] * scale
-                        elif exptime > sorted_ref_exptimes[-1]:
-                            # Extrapolate from highest
-                            scale = exptime / sorted_ref_exptimes[-1]
-                            thermal_templates[(filt, dither, exptime)] = ref_templates[-1] * scale
-                        else:
-                            # Interpolate between two nearest
-                            for i in range(len(sorted_ref_exptimes) - 1):
-                                if sorted_ref_exptimes[i] <= exptime <= sorted_ref_exptimes[i+1]:
-                                    t1, t2 = sorted_ref_exptimes[i], sorted_ref_exptimes[i+1]
-                                    w = (exptime - t1) / (t2 - t1)
-                                    thermal_templates[(filt, dither, exptime)] = (
-                                        ref_templates[i] * (1 - w) + ref_templates[i+1] * w
-                                    )
-                                    break
-                        if verbose:
-                            logging.info(f"      {exptime}s: interpolated from nearby exptimes")
-    
-    # Apply thermal correction to each frame
-    n_corrected = 0
-    n_skipped = 0
-    for f in skysub_files:
-        header = f['header']
-        filt = header.get('FILTER', 'UNK').strip().upper()
-        dither = get_dither_angle_from_header(header)
-        exptime = round(header.get('EXPTIME', 1.0), 2)
-        key = (filt, dither, exptime)
-        
-        template = thermal_templates.get(key)
-        
-        if template is None:
-            # No template available - skip thermal correction for this frame
-            n_skipped += 1
-            if verbose:
-                logging.info(f"    Skipping thermal for {f['file']} (no template for {filt}@{dither}° {exptime}s)")
-            continue  # Leave data unchanged
-        
-        f['data'] = f['data'] - template
-        n_corrected += 1
-        
-        # Update header
-        f['header']['HISTORY'] = 'Thermal pattern correction applied'
-        
-        # Update saved file
-        primary_hdu = fits.PrimaryHDU(f['data'], header=f['header'])
-        noise_hdu = fits.ImageHDU(f['noise'], name='NOISE')
-        hdul = fits.HDUList([primary_hdu, noise_hdu])
-        hdul.writeto(f['path'], overwrite=True)
-    
-    if verbose:
-        logging.info(f"  Thermal correction complete: {n_corrected} corrected, {n_skipped} skipped")
-    
-    return skysub_files
+        w = np.asarray(weights, dtype=np.float64)
+        # Normalise so mean weight = 1 (keeps numerical conditioning stable)
+        wmean = np.mean(w)
+        if wmean > 0:
+            w = w / wmean
+
+    inlier = np.ones(N, dtype=bool)
+
+    for iteration in range(max(1, sigma_clip_iters + 1)):
+        idx = np.where(inlier)[0]
+        if len(idx) < 4:
+            break
+
+        n = len(idx)
+        xs_i, ys_i = xs[idx], ys[idx]
+        xd_i, yd_i = xd[idx], yd[idx]
+        w_i = w[idx]
+
+        # Build weighted design matrix
+        A = np.zeros((2 * n, 4))
+        A[0::2, 0] = xs_i;   A[0::2, 1] = -ys_i;  A[0::2, 2] = 1.0
+        A[1::2, 0] = ys_i;   A[1::2, 1] = xs_i;    A[1::2, 3] = 1.0
+
+        target = np.zeros(2 * n)
+        target[0::2] = xd_i
+        target[1::2] = yd_i
+
+        # Weight matrix (duplicate each weight for x,y equations)
+        W_diag = np.empty(2 * n)
+        W_diag[0::2] = w_i
+        W_diag[1::2] = w_i
+
+        # Weighted least squares: (A^T W A) p = A^T W b
+        AW = A * W_diag[:, None]
+        params, _, _, _ = np.linalg.lstsq(AW, target * W_diag, rcond=None)
+
+        # Compute per-match residuals on ALL pairs (for sigma-clipping)
+        A_full = np.zeros((2 * N, 4))
+        A_full[0::2, 0] = xs;   A_full[0::2, 1] = -ys;  A_full[0::2, 2] = 1.0
+        A_full[1::2, 0] = ys;   A_full[1::2, 1] = xs;    A_full[1::2, 3] = 1.0
+        target_full = np.zeros(2 * N)
+        target_full[0::2] = xd
+        target_full[1::2] = yd
+
+        predicted = A_full @ params
+        res = target_full - predicted
+        # Per-match scalar residual = sqrt(res_x^2 + res_y^2)
+        res_per_match = np.sqrt(res[0::2]**2 + res[1::2]**2)
+
+        if iteration < sigma_clip_iters:
+            med = np.median(res_per_match[inlier])
+            mad = np.median(np.abs(res_per_match[inlier] - med))
+            sigma = mad * 1.4826  # MAD -> sigma
+            if sigma < 1e-6:
+                sigma = 1e-6
+            inlier = res_per_match < med + sigma_clip_threshold * sigma
+
+    a, b, tx, ty = params
+    scale = np.sqrt(a**2 + b**2)
+    rotation_deg = np.degrees(np.arctan2(b, a))
+
+    # RMS on inliers
+    n_used = int(np.sum(inlier))
+    if n_used > 0:
+        rms = np.sqrt(np.mean(res_per_match[inlier]**2))
+    else:
+        rms = np.sqrt(np.mean(res_per_match**2))
+        n_used = N
+
+    return {'a': a, 'b': b, 'tx': tx, 'ty': ty,
+            'rotation_deg': rotation_deg, 'scale': scale,
+            'rms': rms, 'n_used': n_used, 'inlier_mask': inlier}
 
 
 def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False):
-    """Refine alignment using source detection and direct cross-matching.
+    """Refine alignment using source detection, iterative cross-matching,
+    flux-weighted similarity-transform fitting, and sigma-clipping.
     
-    This is more robust than quad matching for small numbers of sources:
+    Algorithm per image:
     1. Compute blind shifts from dither geometry (initial guess)
-    2. Detect sources in all images
-    3. For each image, apply initial shift and cross-match sources with template
-    4. Refine shift using matched sources (least squares)
-    5. Return refined shifts if enough matches, None if failed
+    2. Detect sources in all images (capped to brightest N)
+    3. Iteration 1: apply blind shift, cross-match with wide tolerance,
+       fit similarity transform with flux weights + sigma-clipping
+    4. Iteration 2: re-project through fitted transform, cross-match with
+       tighter tolerance, re-fit.  Recovers sources that were just outside
+       the initial search radius and tightens the solution.
+    5. Return refined transforms if enough matches, blind shift otherwise.
     
     Args:
         skysub_files: List of dicts with 'data', 'noise', 'header', 'path'
@@ -1804,8 +1777,12 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
         verbose: Enable verbose logging
     
     Returns:
-        list or None: List of (dx, dy) tuples for each image if successful, None if failed.
-                     First element is always (0, 0) for template.
+        list or None: List of transform dicts for each image if successful, None if failed.
+                     Each dict has keys: a, b, tx, ty (affine transform parameters),
+                     rotation_deg, scale.  The transform maps image → template:
+                         x_out = a * x - b * y + tx
+                         y_out = b * x + a * y + ty
+                     First element is always the identity for the template.
     """
     refine_cfg = config['alignment'].get('refinement', {})
     
@@ -1823,6 +1800,10 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
     min_matches = refine_cfg.get('min_matches', 4)
     min_match_fraction = refine_cfg.get('min_match_fraction', 0.15)
     accept_rms_px = refine_cfg.get('accept_rms_px', 1.5)
+    max_sources = refine_cfg.get('max_sources', 50)
+    n_refine_iters = refine_cfg.get('n_refine_iters', 2)
+    sigma_clip_iters = refine_cfg.get('sigma_clip_iters', 3)
+    sigma_clip_threshold = refine_cfg.get('sigma_clip_threshold', 3.0)
     
     # First compute blind shifts from dither geometry
     alignment_config = config['alignment'][system]
@@ -1849,7 +1830,7 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
     y_n_tem = y_n - y_n[template_idx]
     blind_shifts = [(-x_n_tem[i], -y_n_tem[i]) for i in range(len(skysub_files))]
     
-    # Detect sources in all images
+    # Detect sources in all images (capped to brightest N)
     all_sources = []
     for idx, file_info in enumerate(skysub_files):
         try:
@@ -1858,9 +1839,13 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
                 npix_min=min_pixels, 
                 threshold_sigma=threshold_sigma
             )
+            # Cap to brightest N (sources already sorted by mag, brightest first)
+            if len(sources) > max_sources:
+                sources = sources[:max_sources]
             all_sources.append(sources)
             if verbose:
-                logging.info(f"    Image {idx}: Detected {len(sources)} sources")
+                logging.info(f"    Image {idx}: Detected {len(sources)} sources"
+                           + (f" (capped to {max_sources})" if len(sources) == max_sources else ""))
         except Exception as e:
             if verbose:
                 logging.info(f"    Image {idx}: Source detection failed: {e}")
@@ -1874,71 +1859,121 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
         return None
     
     template_coords = np.array([[s['x'], s['y']] for s in template_sources])
+    template_fluxes = np.array([max(s.get('flux', 1.0), 1.0) for s in template_sources])
     
     # Refine shifts for each image
     refined_shifts = []
     
     for idx, file_info in enumerate(skysub_files):
         if idx == template_idx:
-            refined_shifts.append((0.0, 0.0))
+            refined_shifts.append({'a': 1.0, 'b': 0.0, 'tx': 0.0, 'ty': 0.0, 'rotation_deg': 0.0, 'scale': 1.0})
             continue
         
         img_sources = all_sources[idx]
         if len(img_sources) < min_matches:
             if verbose:
                 logging.info(f"    Image {idx}: Only {len(img_sources)} sources, using blind shift")
-            refined_shifts.append(blind_shifts[idx])
+            bx, by = blind_shifts[idx]
+            refined_shifts.append({'a': 1.0, 'b': 0.0, 'tx': bx, 'ty': by, 'rotation_deg': 0.0, 'scale': 1.0})
             continue
         
         img_coords = np.array([[s['x'], s['y']] for s in img_sources])
+        img_fluxes = np.array([max(s.get('flux', 1.0), 1.0) for s in img_sources])
         
-        # Apply blind shift to image coords (this should roughly align to template)
+        # Iterative refinement: start with blind shift, then re-match through
+        # the fitted transform with tighter tolerance.
+        current_transform = None
         blind_dx, blind_dy = blind_shifts[idx]
-        img_coords_shifted = img_coords + np.array([blind_dx, blind_dy])
+        best_transform = None
         
-        # Cross-match with template using KDTree
-        tree = cKDTree(template_coords)
-        dists, indices = tree.query(img_coords_shifted, distance_upper_bound=pix_tol)
+        for refine_iter in range(n_refine_iters):
+            # Tolerance: wider on first pass, tighter on subsequent
+            tol = pix_tol if refine_iter == 0 else pix_tol * 0.6
+            
+            if current_transform is None:
+                # First iteration: use blind shift
+                projected = img_coords + np.array([blind_dx, blind_dy])
+            else:
+                # Subsequent iterations: project through current transform
+                a_c, b_c = current_transform['a'], current_transform['b']
+                tx_c, ty_c = current_transform['tx'], current_transform['ty']
+                px = a_c * img_coords[:, 0] - b_c * img_coords[:, 1] + tx_c
+                py = b_c * img_coords[:, 0] + a_c * img_coords[:, 1] + ty_c
+                projected = np.column_stack([px, py])
+            
+            # Cross-match with template using KDTree
+            tree = cKDTree(template_coords)
+            dists, indices = tree.query(projected, distance_upper_bound=tol)
+            
+            matched_mask = dists < tol
+            n_matched = np.sum(matched_mask)
+            match_fraction = n_matched / len(template_sources) if len(template_sources) > 0 else 0
+            
+            if n_matched < min_matches or match_fraction < min_match_fraction:
+                # Not enough matches at this iteration
+                if refine_iter == 0:
+                    # First pass failed entirely
+                    break
+                else:
+                    # Keep previous iteration's result
+                    break
+            
+            # Get matched pairs — use ORIGINAL (unshifted) image coords for transform fit
+            matched_img_orig = img_coords[matched_mask]
+            matched_tmpl = template_coords[indices[matched_mask]]
+            
+            # Flux-based weights: geometric mean of source fluxes in both images
+            # Use sqrt(flux) so very bright stars don't completely dominate
+            w_img = np.sqrt(img_fluxes[matched_mask])
+            w_tmpl = np.sqrt(template_fluxes[indices[matched_mask]])
+            match_weights = np.sqrt(w_img * w_tmpl)
+            
+            # Fit similarity transform with flux weighting + sigma-clipping
+            transform = _fit_similarity_transform(
+                matched_img_orig, matched_tmpl,
+                weights=match_weights,
+                sigma_clip_iters=sigma_clip_iters,
+                sigma_clip_threshold=sigma_clip_threshold
+            )
+            rms = transform['rms']
+            n_used = transform['n_used']
+            
+            if rms <= accept_rms_px:
+                current_transform = transform
+                best_transform = transform
+                best_n_matched = n_matched
+                best_n_used = n_used
         
-        matched_mask = dists < pix_tol
-        n_matched = np.sum(matched_mask)
-        match_fraction = n_matched / len(template_sources)
-        
-        if n_matched < min_matches or match_fraction < min_match_fraction:
+        # Use best transform, or fall back to blind shift
+        if best_transform is None:
             if verbose:
-                logging.info(f"    Image {idx}: Only {n_matched} matches ({match_fraction:.1%}), using blind shift")
-            refined_shifts.append(blind_shifts[idx])
+                n_matched_log = np.sum(dists < pix_tol) if 'dists' in dir() else 0
+                match_frac_log = n_matched_log / len(template_sources) if len(template_sources) > 0 else 0
+                logging.info(f"    Image {idx}: Only {n_matched_log} matches ({match_frac_log:.1%}), using blind shift")
+            bx, by = blind_shifts[idx]
+            refined_shifts.append({'a': 1.0, 'b': 0.0, 'tx': bx, 'ty': by, 'rotation_deg': 0.0, 'scale': 1.0})
             continue
         
-        # Get matched pairs
-        matched_img = img_coords_shifted[matched_mask]
-        matched_tmpl = template_coords[indices[matched_mask]]
+        a, b = best_transform['a'], best_transform['b']
+        rot_deg = best_transform['rotation_deg']
+        scale = best_transform['scale']
+        rms = best_transform['rms']
         
-        # Compute refined shift: mean difference
-        diff = matched_tmpl - matched_img
-        refined_dx = np.mean(diff[:, 0])
-        refined_dy = np.mean(diff[:, 1])
+        # Effective translation at image center (for logging)
+        ny, nx = file_info['data'].shape
+        cx, cy = nx / 2.0, ny / 2.0
+        eff_dx = a * cx - b * cy + best_transform['tx'] - cx
+        eff_dy = b * cx + a * cy + best_transform['ty'] - cy
         
-        # Add to blind shift
-        total_dx = blind_dx + refined_dx
-        total_dy = blind_dy + refined_dy
-        
-        # Compute RMS after refinement
-        residuals = diff - np.array([refined_dx, refined_dy])
-        rms = np.sqrt(np.mean(np.sum(residuals**2, axis=1)))
-        
-        if rms > accept_rms_px:
-            if verbose:
-                logging.info(f"    Image {idx}: RMS={rms:.3f}px too high, using blind shift")
-            refined_shifts.append(blind_shifts[idx])
-            continue
-        
-        refined_shifts.append((total_dx, total_dy))
+        refined_shifts.append({
+            'a': a, 'b': b, 'tx': best_transform['tx'], 'ty': best_transform['ty'],
+            'rotation_deg': rot_deg, 'scale': scale
+        })
         
         if verbose:
-            logging.info(f"    Image {idx}: Refined shift dx={total_dx:.3f}, dy={total_dy:.3f} "
-                        f"(correction: {refined_dx:+.3f}, {refined_dy:+.3f}, "
-                        f"matches={n_matched}, RMS={rms:.3f}px)")
+            logging.info(f"    Image {idx}: Refined shift dx={eff_dx:.3f}, dy={eff_dy:.3f} "
+                        f"(rot={rot_deg:+.4f} deg, scale={scale:.5f}, "
+                        f"matches={best_n_matched}, used={best_n_used}, RMS={rms:.3f}px)")
     
     if verbose:
         logging.info("  Alignment refinement complete!")
@@ -1946,25 +1981,161 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
     return refined_shifts
 
 
+def drizzle_image(data, noise, transform, output_shape=None, pixfrac=1.0):
+    """Apply drizzling with full affine transform (rotation + scale + translation).
+    
+    VECTORIZED implementation. Each input pixel at position (x, y) maps to output:
+        x_out = a * x - b * y + tx
+        y_out = b * x + a * y + ty
+    
+    For pure translation: a=1, b=0, tx=dx, ty=dy.
+    
+    Unlike a two-step approach (interpolation pre-correction + shift drizzle),
+    this applies the full geometric transform in a single drizzle pass — no
+    double interpolation, preserving image sharpness.  This is the same
+    principle as AQuA/PREPROCESS's polygon-intersection remapping: each input
+    pixel's flux is distributed to output pixels based on geometric overlap.
+    
+    The pixel drop is an axis-aligned square of side ``pixfrac`` centred at the
+    transformed position.  For rotations below ~5 degrees the error from
+    ignoring the pixel-shape rotation is < 0.05 pixels per edge — negligible
+    compared to typical REMIR seeing.
+    
+    Args:
+        data: Input 2D array to be drizzled
+        noise: Input 2D noise array
+        transform: dict with affine transform parameters:
+            - 'a', 'b', 'tx', 'ty' for full similarity transform, or
+            - 'dx', 'dy' for pure translation (a=1, b=0)
+        output_shape: Shape of output array, defaults to input shape
+        pixfrac: Pixel fraction (1.0 = full pixel, <1.0 = shrink for sharper PSF)
+    
+    Returns:
+        tuple: (drizzled_data, drizzled_noise, weight_map)
+    """
+    if output_shape is None:
+        output_shape = data.shape
+    
+    ny_out, nx_out = output_shape
+    ny_in, nx_in = data.shape
+    
+    # Extract affine transform parameters
+    a = transform.get('a', 1.0)
+    b = transform.get('b', 0.0)
+    tx = transform.get('tx', transform.get('dx', 0.0))
+    ty = transform.get('ty', transform.get('dy', 0.0))
+    
+    # Initialize output arrays
+    flux_out = np.zeros(output_shape, dtype=np.float64)
+    var_out = np.zeros(output_shape, dtype=np.float64)
+    weight_out = np.zeros(output_shape, dtype=np.float64)
+    
+    # Create coordinate grids for all input pixels
+    iy_in, ix_in = np.mgrid[0:ny_in, 0:nx_in]
+    ix = ix_in.astype(np.float64)
+    iy = iy_in.astype(np.float64)
+    
+    # Transform input pixel centers to output coordinates (full affine)
+    x_center = a * ix - b * iy + tx
+    y_center = b * ix + a * iy + ty
+    
+    # Pixel drop boundaries (axis-aligned square of side pixfrac)
+    half_pix = pixfrac / 2.0
+    x_min = x_center - half_pix
+    x_max = x_center + half_pix
+    y_min = y_center - half_pix
+    y_max = y_center + half_pix
+    
+    # Get valid (non-NaN) pixels
+    valid = np.isfinite(data)
+    flux = np.where(valid, data, 0).astype(np.float64)
+    var = np.where(valid, noise**2, 0).astype(np.float64)
+    
+    # For pixfrac <= 1, each input pixel overlaps at most 4 output pixels (2x2).
+    # Output pixel i extends from [i-0.5, i+0.5], so position p belongs to
+    # pixel floor(p + 0.5).  This is the correct mapping for pixel centers at
+    # integer coordinates, fixing a boundary rounding issue.
+    ox_lo = np.floor(x_min + 0.5).astype(np.int32)
+    ox_hi = np.floor(x_max + 0.5).astype(np.int32)
+    oy_lo = np.floor(y_min + 0.5).astype(np.int32)
+    oy_hi = np.floor(y_max + 0.5).astype(np.int32)
+    
+    # Process the 4 possible output pixels per input pixel (2x2 grid)
+    for oy_idx, ox_idx in [(oy_lo, ox_lo), (oy_lo, ox_hi), (oy_hi, ox_lo), (oy_hi, ox_hi)]:
+        # Check bounds
+        in_bounds = (ox_idx >= 0) & (ox_idx < nx_out) & (oy_idx >= 0) & (oy_idx < ny_out) & valid
+        
+        if not np.any(in_bounds):
+            continue
+        
+        # Output pixel boundaries (centered at integer coordinates)
+        ox_min_grid = ox_idx - 0.5
+        ox_max_grid = ox_idx + 0.5
+        oy_min_grid = oy_idx - 0.5
+        oy_max_grid = oy_idx + 0.5
+        
+        # Compute overlap rectangle
+        overlap_x_min = np.maximum(x_min, ox_min_grid)
+        overlap_x_max = np.minimum(x_max, ox_max_grid)
+        overlap_y_min = np.maximum(y_min, oy_min_grid)
+        overlap_y_max = np.minimum(y_max, oy_max_grid)
+        
+        # Overlap area (zero if no overlap)
+        overlap_x = np.maximum(0, overlap_x_max - overlap_x_min)
+        overlap_y = np.maximum(0, overlap_y_max - overlap_y_min)
+        overlap_area = overlap_x * overlap_y
+        
+        # Mask: in bounds, valid, and has overlap
+        contrib_mask = in_bounds & (overlap_area > 0)
+        
+        if not np.any(contrib_mask):
+            continue
+        
+        # Extract contributing pixels
+        oy_flat = oy_idx[contrib_mask]
+        ox_flat = ox_idx[contrib_mask]
+        area_flat = overlap_area[contrib_mask]
+        flux_flat = flux[contrib_mask]
+        var_flat = var[contrib_mask]
+        
+        # Accumulate using np.add.at (handles duplicate indices correctly)
+        np.add.at(flux_out, (oy_flat, ox_flat), flux_flat * area_flat)
+        np.add.at(var_out, (oy_flat, ox_flat), var_flat * area_flat**2)
+        np.add.at(weight_out, (oy_flat, ox_flat), area_flat)
+    
+    # Normalize by weight (avoid division by zero)
+    mask = weight_out > 1e-10
+    drizzled_data = np.full(output_shape, np.nan, dtype=np.float32)
+    drizzled_noise = np.full(output_shape, np.nan, dtype=np.float32)
+    
+    drizzled_data[mask] = (flux_out[mask] / weight_out[mask]).astype(np.float32)
+    drizzled_noise[mask] = (np.sqrt(var_out[mask]) / weight_out[mask]).astype(np.float32)
+    
+    return drizzled_data, drizzled_noise, weight_out.astype(np.float32)
+
+
 def align_frames(skysub_files, config, system, output_dir, verbose=False):
-    """Align sky-subtracted frames using dither geometry (optionally refined with quad matching).
+    """Align sky-subtracted frames using dither geometry (optionally refined).
     
     REMIR uses a rotating wedge prism that introduces predictable dither
     offsets based on the dither angle. This function calculates the
-    expected pixel shifts and applies subpixel interpolation to align
-    all frames to the first frame (template).
+    expected pixel shifts and applies a single-pass affine drizzle to
+    align all frames to the first frame (template).
     
     Optional refinement: If enabled in config, attempts to refine the alignment
-    by detecting sources and matching geometric quads between images. Falls back
-    to blind dither geometry if refinement fails.
+    by detecting sources and cross-matching between images, fitting a full
+    similarity transform (rotation + scale + translation). Falls back to blind
+    dither geometry if refinement fails.
     
     Shift calculation (blind mode):
         dx = r_n * cos(dith_angle + theta_offset + theta_n + base_angle)
         dy = r_n * sin(dith_angle + theta_offset + theta_n + base_angle)
         shift = (dx - dx_template, dy - dy_template)
     
-    Noise is increased by interpolation_noise_factor to account for
-    correlated noise from subpixel interpolation.
+    The affine drizzle distributes each input pixel's flux among output pixels
+    based on geometric overlap, handling rotation + scale + translation in one
+    pass with no double interpolation. This follows the same principle as
+    AQuA/PREPROCESS's polygon-intersection remapping.
     
     Args:
         skysub_files: List of dicts with 'data', 'noise', 'header', 'path'
@@ -1982,7 +2153,6 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
     r_n = alignment_config['r_n']
     theta_offset = alignment_config['theta_offset']
     dithangl_key = alignment_config['dithangl_key']
-    alpha = config['alignment']['interpolation_noise_factor']
     base_angle = config['alignment'].get('base_angle', 72)
     
     # Try refinement if enabled
@@ -1993,7 +2163,7 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
     if refine_cfg.get('enabled', False):
         refined_shifts = refine_alignment_with_crossmatch(skysub_files, config, system, verbose=verbose)
         if refined_shifts is not None:
-            alignment_method = "cross-match refinement"
+            alignment_method = "similarity-transform refinement"
         else:
             if verbose:
                 logging.info("  Refinement failed, falling back to blind dither geometry")
@@ -2022,24 +2192,44 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
         y_n_tem = y_n - y_n[template_idx]
         
         # Compute shifts (note: negative because we shift image, not coordinate system)
-        refined_shifts = [(-x_n_tem[i], -y_n_tem[i]) for i in range(len(skysub_files))]
+        refined_shifts = [{'a': 1.0, 'b': 0.0, 'tx': -x_n_tem[i], 'ty': -y_n_tem[i]}
+                          for i in range(len(skysub_files))]
     
-    # Apply shifts to all images
+    # Apply transforms to all images using drizzling (flux-preserving, no interpolation smoothing)
     template_idx = 0
     aligned_files = []
+    
+    pixfrac = config['alignment'].get('drizzle_pixfrac', 1.0)  # Pixel fraction for drizzling
+    
+    if verbose:
+        logging.info(f"  Applying affine drizzle (pixfrac={pixfrac})...")
     
     for idx, file_info in enumerate(skysub_files):
         header = file_info['header']
         data = file_info['data']
         noise = file_info['noise']
         
-        # Get shift for this image
-        dx, dy = refined_shifts[idx]
+        # Get full affine transform for this image
+        shift_info = refined_shifts[idx]
         
-        # Apply spatial shifts with linear interpolation
-        data_aligned = shift(data, shift=(dy, dx), order=1, mode='constant', cval=np.nan)
-        noise_aligned = shift(noise, shift=(dy, dx), order=1, mode='constant', cval=np.nan)
-        noise_aligned *= alpha
+        # Apply drizzling with full affine transform in a single pass.
+        # Rotation + scale + translation are handled together — no separate
+        # interpolation step, no double-smoothing.
+        data_aligned, noise_aligned, weight = drizzle_image(
+            data, noise, shift_info, output_shape=data.shape, pixfrac=pixfrac
+        )
+        
+        # Compute effective shift at image center (for logging / FITS headers)
+        a_t = shift_info.get('a', 1.0)
+        b_t = shift_info.get('b', 0.0)
+        tx_t = shift_info.get('tx', shift_info.get('dx', 0.0))
+        ty_t = shift_info.get('ty', shift_info.get('dy', 0.0))
+        ny, nx = data.shape
+        cx, cy = nx / 2.0, ny / 2.0
+        dx = (a_t - 1) * cx - b_t * cy + tx_t
+        dy = b_t * cx + (a_t - 1) * cy + ty_t
+        rot_val = shift_info.get('rotation_deg', 0.0)
+        scale_val = shift_info.get('scale', 1.0)
         
         aligned_filename = file_info['file'].replace('_skysub.fits', '_skysub_aligned.fits')
         aligned_path = os.path.join(output_dir, aligned_filename)
@@ -2051,19 +2241,28 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
         aligned_header['DATE'] = format_date_like_dateobs(header['DATE-OBS'])
         aligned_header['HISTORY'] = f"Aligned to template {skysub_files[template_idx]['file']}"
         aligned_header['HISTORY'] = f"Applied shift: dx={dx:.3f}, dy={dy:.3f} pixels"
-        aligned_header['HISTORY'] = f"Alignment method: {alignment_method}"
+        aligned_header['HISTORY'] = f"Alignment method: {alignment_method} (affine drizzle)"
+        aligned_header['HISTORY'] = f"Drizzle pixfrac: {pixfrac}"
+        if abs(rot_val) > 1e-6 or abs(scale_val - 1.0) > 1e-6:
+            aligned_header['HISTORY'] = f"Affine drizzle: rot={rot_val:+.4f} deg, scale={scale_val:.5f}"
         if alignment_method == "blind dither geometry":
             aligned_header['HISTORY'] = f"Dithering pattern: theta_n={theta_n}, r_n={r_n}, theta_off={theta_offset}"
         aligned_header['ALIGNED'] = (True, 'File has been aligned')
-        aligned_header['ALIGNMTH'] = (alignment_method, 'Alignment method used')
+        aligned_header['ALIGNMTH'] = (f"{alignment_method} (affine drizzle)", 'Alignment method used')
+        aligned_header['DRZLPIXF'] = (pixfrac, 'Drizzle pixel fraction')
         aligned_header['TEMPLATE'] = (idx == template_idx, 'This is the template file')
         if idx != template_idx:
-            aligned_header['SHIFT_X'] = (dx, 'Applied X shift in pixels')
-            aligned_header['SHIFT_Y'] = (dy, 'Applied Y shift in pixels')
+            aligned_header['SHIFT_X'] = (dx, 'Effective X shift at image center [pixels]')
+            aligned_header['SHIFT_Y'] = (dy, 'Effective Y shift at image center [pixels]')
+        if abs(rot_val) > 1e-6:
+            aligned_header['ROT_DEG'] = (rot_val, 'Rotation angle [degrees]')
+        if abs(scale_val - 1.0) > 1e-6:
+            aligned_header['SCALE'] = (scale_val, 'Scale factor')
         
         primary_hdu = fits.PrimaryHDU(data_aligned, header=aligned_header)
         noise_hdu = fits.ImageHDU(noise_aligned, name='NOISE')
-        hdul = fits.HDUList([primary_hdu, noise_hdu])
+        weight_hdu = fits.ImageHDU(weight, name='WEIGHT')
+        hdul = fits.HDUList([primary_hdu, noise_hdu, weight_hdu])
         hdul.writeto(aligned_path, overwrite=True)
         
         aligned_files.append({
@@ -2071,6 +2270,7 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
             'path': aligned_path,
             'data': data_aligned,
             'noise': noise_aligned,
+            'weight': weight,
             'header': aligned_header
         })
     
@@ -2079,17 +2279,24 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
 def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, config, verbose=False):
     """Combine aligned frames into a single coadded image.
     
-    Performs pixel-by-pixel summation of aligned frames (nansum to handle
-    bad pixels marked as NaN). Noise is propagated as quadrature sum.
+    Performs inverse-variance weighted combination of aligned frames.
+    Drizzle-edge pixels with higher noise automatically receive lower weight,
+    producing cleaner coadds with optimal signal-to-noise.
+    
+    Algorithm:
+    1. Compute inverse-variance weights: w_i = 1 / noise_i^2
+    2. Weighted mean: coadd = sum(data_i * w_i) / sum(w_i)
+    3. Optimal noise: noise = sqrt(1 / sum(w_i))
     
     The coadd header includes:
     - DITHID=99: Marker for coadded images
-    - EXPTIME: Sum of individual exposure times
+    - EXPTIME: Total exposure time (sum of all frames)
+    - NCOADD: Number of coadded frames
     - DATE-OBS: Average of observation timestamps
     - INCOMP: Flag indicating if dither sequence was incomplete
     
     Args:
-        aligned_files: List of dicts with 'data', 'noise', 'header', 'path'
+        aligned_files: List of dicts with 'data', 'noise', 'weight', 'header', 'path'
         group_name: String identifier for the group (used in filename)
         output_dir: Directory to write coadd FITS file
         is_incomplete: True if this is from an incomplete dither sequence
@@ -2101,9 +2308,31 @@ def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, c
     """
     data_stack = np.array([f['data'] for f in aligned_files])
     noise_stack = np.array([f['noise'] for f in aligned_files])
+    weight_stack = np.array([f.get('weight', np.ones_like(f['data'])) for f in aligned_files])
     
-    data_coadd = np.nansum(data_stack, axis=0)
-    noise_coadd = np.sqrt(np.nansum(noise_stack**2, axis=0))
+    n_frames = len(aligned_files)
+    
+    # ========== INVERSE-VARIANCE WEIGHTED CO-ADDITION ==========
+    # Drizzle-edge pixels have higher noise -> automatically get lower weight
+    # This produces a cleaner coadd with proper noise properties
+    var_stack = noise_stack**2
+    valid = np.isfinite(data_stack) & np.isfinite(noise_stack) & (var_stack > 0)
+    inv_var = np.where(valid, 1.0 / var_stack, 0.0)
+    sum_inv_var = np.sum(inv_var, axis=0)
+    good = sum_inv_var > 1e-10
+    
+    data_coadd = np.full(data_stack.shape[1:], np.nan, dtype=np.float32)
+    noise_coadd = np.full_like(data_coadd, np.nan)
+    
+    # Weighted mean: sum(data_i / sigma_i^2) / sum(1 / sigma_i^2)
+    data_coadd[good] = (np.sum(np.where(valid, data_stack * inv_var, 0), axis=0)[good] /
+                         sum_inv_var[good]).astype(np.float32)
+    
+    # Optimal noise: sqrt(1 / sum(1 / sigma_i^2))
+    noise_coadd[good] = np.sqrt(1.0 / sum_inv_var[good]).astype(np.float32)
+    
+    # Coverage weight map (sum of drizzle weights across all frames)
+    weight_coadd = np.sum(np.where(valid, weight_stack, 0), axis=0).astype(np.float32)
     
     coadd_filename = f"{group_name}.fits"
     coadd_path = os.path.join(output_dir, coadd_filename)
@@ -2118,16 +2347,20 @@ def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, c
     coadd_header['DATE-OBS'] = average_date_obs([h['DATE-OBS'] for h in headers])
     
     exptimes = [h.get('EXPTIME', 0) for h in headers]
-    coadd_header['EXPTIME'] = (np.sum(exptimes), 'Total exposure time (sum)')
+    coadd_header['EXPTIME'] = (float(np.sum(exptimes)), 'Total exposure time (sum of all frames) [s]')
+    coadd_header['NCOADD'] = (n_frames, 'Number of coadded frames')
     
     coadd_header['DATE'] = format_date_like_dateobs(coadd_header['DATE-OBS'])
     coadd_header['INCOMP'] = 1 if is_incomplete else 0
-    coadd_header['HISTORY'] = f"Coadded from {len(aligned_files)} aligned frames"
+    coadd_header['HISTORY'] = f"Coadded from {n_frames} aligned frames (inverse-variance weighted mean)"
+    coadd_header['COMMENT'] = "Inverse-variance weighted mean; pixel values at single-frame level"
+    coadd_header['COMMENT'] = "WEIGHT extension = sum of drizzle coverage weights per pixel"
     coadd_header['COMMENT'] = "Note: GAIN and RON values are from individual frames, not effective coadd values"
     
     primary_hdu = fits.PrimaryHDU(data_coadd, header=coadd_header)
     noise_hdu = fits.ImageHDU(noise_coadd, name='NOISE')
-    hdul = fits.HDUList([primary_hdu, noise_hdu])
+    weight_hdu = fits.ImageHDU(weight_coadd, name='WEIGHT')
+    hdul = fits.HDUList([primary_hdu, noise_hdu, weight_hdu])
     hdul.writeto(coadd_path, overwrite=True)
     # Count coadds created
     STATS['coadds'] += 1
@@ -2405,6 +2638,12 @@ def detect_sources(data, config, npix_min, threshold_sigma, return_rms_matrix=Fa
         bkg_rms = bkg.globalrms
         threshold = threshold_sigma * bkg_rms
         
+        # Raise deblending sub-object limit to avoid overflow on crowded fields
+        try:
+            sep.set_sub_object_limit(4096)
+        except Exception:
+            pass
+        
         # Extract sources
         objects = sep.extract(data_sub, threshold, minarea=npix_min)
         
@@ -2423,19 +2662,27 @@ def detect_sources(data, config, npix_min, threshold_sigma, return_rms_matrix=Fa
                     circ_mask = (x - cx)**2 + (y - cy)**2 <= radius**2
                     mask |= circ_mask
     
-    # Create sources list
+    # Create sources list (vectorized)
     sources = []
-    if objects is not None:
-        for obj in objects:
-            flux = float(obj['flux'])
-            sources.append({
+    if objects is not None and len(objects) > 0:
+        # Vectorized magnitude calculation
+        fluxes = objects['flux'].astype(np.float64)
+        valid_flux = fluxes > 0
+        mags = np.full(len(fluxes), default_mag)
+        mags[valid_flux] = -2.5 * np.log10(fluxes[valid_flux]) + inst_zp
+        
+        # Build sources list (now with pre-computed mags)
+        sources = [
+            {
                 'x': float(obj['x']),
                 'y': float(obj['y']),
-                'flux': flux,
-                'mag': -2.5 * np.log10(flux) + inst_zp if flux > 0 else default_mag,
-                'a': float(obj['a']),  # Semi-major axis for FWHM estimation
-                'b': float(obj['b'])   # Semi-minor axis for FWHM estimation
-            })
+                'flux': float(obj['flux']),
+                'mag': float(mags[i]),
+                'a': float(obj['a']),
+                'b': float(obj['b'])
+            }
+            for i, obj in enumerate(objects)
+        ]
     
     # Sort by magnitude (brightest first)
     sources.sort(key=lambda s: s['mag'])
@@ -2521,9 +2768,8 @@ def build_quads_heap(table, G=2000):
 def match_quads(det_quads, cat_quads, config):
     """Find matching quads between detections and catalog.
     
-    Compares geometric hash codes of all detection-catalog quad pairs
-    using L2 norm. Hash codes are scale/rotation-invariant, so matching
-    quads indicate similar star patterns regardless of image orientation.
+    VECTORIZED implementation - compares all quad pairs using matrix operations.
+    Uses scipy.spatial.distance.cdist for fast pairwise L2 distance computation.
     
     Args:
         det_quads: List of detection quads from build_quads_heap()
@@ -2536,26 +2782,31 @@ def match_quads(det_quads, cat_quads, config):
     """
     threshold = config['astrometry']['threshold_code']
     
+    if not det_quads or not cat_quads:
+        return []
+    
+    # Extract hash arrays for vectorized comparison
+    det_hashes = np.array([q['hash'] for q in det_quads])
+    cat_hashes = np.array([q['hash'] for q in cat_quads])
+    
+    # Compute all pairwise L2 distances at once
+    dists = cdist(det_hashes, cat_hashes, metric='euclidean')
+    
+    # Find matches below threshold
+    match_i, match_j = np.where(dists < threshold)
+    match_dists = dists[match_i, match_j]
+    
+    # Sort by distance (best matches first)
+    sort_idx = np.argsort(match_dists)
+    
     matches = []
-    
-    for det_quad in det_quads:
-        det_hash = det_quad['hash']
-        
-        for cat_quad in cat_quads:
-            cat_hash = cat_quad['hash']
-            
-            # Compare hashes using L2 norm
-            hash_diff = np.linalg.norm(det_hash - cat_hash)
-            
-            if hash_diff < threshold:
-                matches.append({
-                    'det_quad': det_quad,
-                    'cat_quad': cat_quad,
-                    'hash_diff': hash_diff
-                })
-    
-    # Sort by hash difference (best matches first)
-    matches.sort(key=lambda x: x['hash_diff'])
+    for idx in sort_idx:
+        i, j = match_i[idx], match_j[idx]
+        matches.append({
+            'det_quad': det_quads[i],
+            'cat_quad': cat_quads[j],
+            'hash_diff': match_dists[idx]
+        })
     
     return matches
 
@@ -2937,7 +3188,7 @@ def generate_photometry_plot(mag_inst_all, mag_cat_all, mag_inst_err_all,
                 markeredgewidth=2, alpha=0.6)
     
     # Plot used stars in blue
-    ax2.errorbar(mag_cat_used, residuals_used, yerr=mag_cat_err_used,
+    ax2.errorbar(mag_cat_used, residuals_used, yerr=mag_inst_err_used,
                  fmt='o', alpha=0.6, markersize=6, color='blue')
     ax2.axhline(0, color='g', linestyle='--', linewidth=2, label='Zero')
     ax2.axhline(rms, color='gray', linestyle=':', linewidth=2, label=f'±{rms:.3f} mag')
@@ -2961,7 +3212,7 @@ def generate_photometry_plot(mag_inst_all, mag_cat_all, mag_inst_err_all,
 def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err, 
                            rms, n_stars, aperture_radius, filter_name, filename,
                            config, mag_lim=None, threshold_sigma=None, min_pixels=None, n_total=None,
-                           date_obs=None, exptime=None):
+                           date_obs=None, exptime=None, object_name=None):
     """Save photometry catalog as .txt file with calibration info in header.
     
     Columns: ra dec x y mag_inst e_mag_inst mag_cat e_mag_cat mag_cal e_mag_cal flag
@@ -2976,6 +3227,7 @@ def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err,
     with open(output_path, 'w') as f:
         # Write header comments
         f.write(f"# Photometric Calibration for {filename}\n")
+        f.write(f"# OBJECT: {object_name}\n")
         if date_obs is not None:
             f.write(f"# DATE-OBS: {date_obs}\n")
         if exptime is not None:
@@ -3352,7 +3604,8 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         min_pixels=phot_cfg['min_pixels'],
         n_total=n_total,
         date_obs=header.get('DATE-OBS'),
-        exptime=header.get('EXPTIME')
+        exptime=header.get('EXPTIME'),
+        object_name=header.get('OBJECT', None)
     )
     
     if verbose:
@@ -4040,24 +4293,33 @@ def main():
         # Process groups
         processable_groups = valid_groups + incomplete_groups
         
+        # First pass: sky subtraction for all groups
+        all_skysub_by_group = []  # Collect for thermal correction
+        group_results = []  # Store results for second pass
+        
         for group in processable_groups:
             is_incomplete = group in incomplete_groups
             
-            # Sky subtraction
+            # Sky subtraction (level matching + single sky + flat fielding)
             sky_path, skysub_files, group_name = process_group_sky_subtraction(
                 group, config, system_dir, args.verbose
             )
             
-            # Copy sky to reduced
+            # Copy single sky file to reduced
             sky_reduced_path = os.path.join(reduced_dir, os.path.basename(sky_path))
             shutil.copy2(sky_path, sky_reduced_path)
-            # Generate preview JPG for sky in reduced
             generate_preview_jpg(sky_reduced_path, config)
             
-            # Thermal pattern correction
-            skysub_files = apply_thermal_correction(skysub_files, config, system_dir, args.verbose)
-            
-            # Alignment
+            # Collect for thermal correction
+            all_skysub_by_group.append((group['key'], skysub_files))
+            group_results.append((group, skysub_files, group_name, is_incomplete))
+        
+        # Apply thermal residual correction to all skysub files
+        apply_thermal_residual_correction(all_skysub_by_group, config, system_dir, args.verbose)
+        
+        # Second pass: alignment and coadding
+        for group, skysub_files, group_name, is_incomplete in group_results:
+            # Alignment (using drizzling algorithm)
             aligned_files = align_frames(skysub_files, config, system, system_dir, args.verbose)
             
             # Coadd
@@ -4110,6 +4372,17 @@ def main():
 
         # Major division for each coadd (always printed)
         log_big_divider(f"Processing {os.path.basename(coadd_path)}")
+
+        # Check if filter should skip astrometry (e.g., GRISM, dispersed modes)
+        with fits.open(coadd_path) as _hdul:
+            _filter_name = _hdul[0].header.get('FILTER', '').strip()
+        skip_filters = config.get('astrometry', {}).get('skip_filters', [])
+        if _filter_name in skip_filters:
+            logging.info(f"  Filter '{_filter_name}' in skip_filters — copying as-is")
+            save_without_astrometry(coadd_path, reduced_dir, config)
+            for aligned_path in coadd_to_aligned.get(coadd_path, []):
+                save_without_astrometry(aligned_path, reduced_dir, config)
+            continue
 
         # Try astrometry
         wcs, n_matches, attempt_info = astrometry_on_coadd(

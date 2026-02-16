@@ -43,15 +43,22 @@ calibration:
   enable_pixel_mask: true      # Apply bad pixel mask
   mask_file: pixel_mask.fits   # Bad pixel mask FITS in data_folder (0=bad, 1=good), or null
   
-  # 2) Flat field correction - applied before sky subtraction
+  # 2) Flat field correction - applied after sky subtraction
   enable_flat_correction: true # Apply flat field correction (data / flat)
   
-  # 3) Thermal pattern correction - applied after sky subtraction
-  enable_thermal_correction: true  # Apply thermal pattern correction
-  thermal_use_static: true    # Use static templates from data_folder
-                               # If true: loads {FILTER}_dither{ANGLE}_exptime{SEC}_thermal.fits
-                               # If false: builds templates dynamically from same-night data
-  thermal_min_frames: 10       # Minimum frames per filter×dither×exptime to build template
+  # 3) Thermal residual correction - post-processing after sky subtraction
+  # Scales all skysub files to 10s reference, takes median → thermal template
+  # Applies template scaled by EXPTIME/10 (linear thermal assumption)
+  enable_thermal_correction: true    # Apply thermal residual correction
+  thermal_filters: [K]      # Filters for thermal residual correction
+  
+  # Thermal correction diversity requirements
+  # The template is reliable only when built from many files spanning
+  # several distinct sky pointings (so real sources wash out in the median).
+  thermal_requirements:
+    min_files: 10              # Minimum number of skysub files per (filter, dither_angle) group
+    min_positions: 3           # Minimum number of unique RA/DEC pointings
+    min_separation_arcsec: 10.0  # Two pointings are "different" only if separated by ≥ this [arcsec]
 
 # ============================================================================
 # GROUPING PARAMETERS (for sky subtraction)
@@ -88,7 +95,8 @@ alignment:
     theta_n: 5                 # Dither pattern rotation parameter [degrees]
     r_n: 17                    # Dither step radius [pixels]
   
-  interpolation_noise_factor: 1.2  # Noise increase from subpixel interpolation (1.1-1.3 typical)
+  drizzle_pixfrac: 0.8          # Drizzle pixel fraction (1.0=full pixel, <1.0=shrink for sharper PSF)
+                               # 0.8 gives ~10% sharper PSF with minimal noise penalty
   
   # Optional alignment refinement (uses source detection & cross-matching)
   refinement:
@@ -98,12 +106,18 @@ alignment:
     # Source detection for alignment
     min_pixels: 5              # Minimum connected pixels above threshold
     threshold_sigma: 2.0       # Detection threshold in sigma
+    max_sources: 50            # Cap to N brightest sources (avoids noise from faint sources)
     
     # Cross-matching and acceptance
     pix_tol: 2.0               # Pixel tolerance for source matching [pixels]
     min_matches: 4             # Min matched sources to accept refined shift
     min_match_fraction: 0.15   # Min fraction of template sources that must match (15%)
     accept_rms_px: 1.5         # Max RMS residual to accept refined solution [pixels]
+    
+    # Iterative refinement
+    n_refine_iters: 2          # Number of match-fit iterations (2 = re-match through fitted transform)
+    sigma_clip_iters: 3        # Sigma-clipping rounds inside each fit
+    sigma_clip_threshold: 3.0  # Reject matches > this many sigma
     
     # Fallback behavior
     fallback_to_blind: true    # If true, use blind alignment when refinement fails
@@ -202,6 +216,18 @@ astrometry:
     GRI: ["H"]                 # For optical: use H
   
   try_reflection: false         # Try mirror-flipped geometry if normal fails
+  skip_filters: ["GRISM", "H2"] # Filters to skip entirely (dispersed/non-imaging modes)
+                                # These coadds are copied to output without astrometry
+
+# ============================================================================
+# CO-ADDITION (STACKING)
+# ============================================================================
+coadd:
+  # Inverse-variance weighted mean of aligned frames
+  # coadd = Σ(data_i / σ_i²) / Σ(1 / σ_i²)
+  # noise = √(1 / Σ(1 / σ_i²))
+  # Pixel values at single-frame level; EXPTIME = total sum
+  # No configurable parameters
 
 # ============================================================================
 # PHOTOMETRIC CALIBRATION PARAMETERS
