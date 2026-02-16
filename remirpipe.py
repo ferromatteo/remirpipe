@@ -86,6 +86,9 @@ def parse_arguments():
                         help='Apply scale constraints (0.95-1.05) for astrometry')
     parser.add_argument('-co', '--clean-output', action='store_true',
                         help='Clean existing output directories before starting')
+    parser.add_argument('-t', '--target', nargs='+', default=None,
+                        help='Target OBJECT name(s) for astrometry/photometry only (e.g. -t NGC1234 M31). '
+                             'All data are processed but astrometry and photometry are performed only on matching OBJECTs.')
     
     return parser.parse_args()
 
@@ -4259,6 +4262,8 @@ def main():
     logging.info(f"Input directory: {input_dir}")
     logging.info(f"Output directory: {output_dir}")
     logging.info(f"Config file: {args.config}")
+    if args.target:
+        logging.info(f"Target filter: astrometry/photometry only for OBJECT in {args.target}")
     logging.info("")
     
     # Step 1: Gunzip files
@@ -4373,9 +4378,20 @@ def main():
         # Major division for each coadd (always printed)
         log_big_divider(f"Processing {os.path.basename(coadd_path)}")
 
-        # Check if filter should skip astrometry (e.g., GRISM, dispersed modes)
+        # Read header once for filter and object checks
         with fits.open(coadd_path) as _hdul:
             _filter_name = _hdul[0].header.get('FILTER', '').strip()
+            _object_name = _hdul[0].header.get('OBJECT', '').strip()
+
+        # If -t/--target was given, skip astrometry/photometry for non-matching OBJECTs
+        if args.target and _object_name not in args.target:
+            logging.info(f"  OBJECT '{_object_name}' not in target list — skipping astrometry/photometry")
+            save_without_astrometry(coadd_path, reduced_dir, config)
+            for aligned_path in coadd_to_aligned.get(coadd_path, []):
+                save_without_astrometry(aligned_path, reduced_dir, config)
+            continue
+
+        # Check if filter should skip astrometry (e.g., GRISM, dispersed modes)
         skip_filters = config.get('astrometry', {}).get('skip_filters', [])
         if _filter_name in skip_filters:
             logging.info(f"  Filter '{_filter_name}' in skip_filters — copying as-is")

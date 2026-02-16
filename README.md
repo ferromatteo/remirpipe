@@ -35,9 +35,7 @@ pip install numpy scipy astropy photutils matplotlib pyyaml pandas sep requests
 
 ### Calibration Files
 
-Create calibration files following [CALIBRATION_CREATION_GUIDE.md](CALIBRATION_CREATION_GUIDE.md).
-
-Place in `data_folder` directory (configured in `config.yaml`, default: `data_2026_01/`):
+Place calibration files in the `data_folder` directory (configured in `config.yaml`, default: `data_2026_01/`):
 
 ```
 data_2026_01/
@@ -65,7 +63,7 @@ cd remirpipe
 pip install -r requirements.txt
 ```
 
-3. Prepare calibration files (see `CALIBRATION_CREATION_GUIDE.md`)
+3. Prepare calibration files (pixel mask + master flats)
 
 4. Edit `config.yaml` to match your setup (data paths, processing parameters)
 
@@ -90,6 +88,9 @@ Optional:
   -d, --delete-tmp         Delete tmp/ directory after completion
   -s, --scale-constraint   Apply strict scale limits (0.95-1.05) for astrometry
   -co, --clean-output      Clean existing output directories before starting
+  -t, --target NAME [NAME ...]
+                           Target OBJECT name(s): all data are processed but
+                           astrometry/photometry runs only on matching OBJECTs
 ```
 
 ### Examples
@@ -107,6 +108,11 @@ python remirpipe.py -i ./data -o ./reduced -c custom.yaml -co -v
 **Strict astrometry with cleanup:**
 ```bash
 python remirpipe.py -i ./data -s -d -v
+```
+
+**Process all data but run astrometry/photometry only on specific targets:**
+```bash
+python remirpipe.py -i ./data -t NGC1234 M31 -v
 ```
 
 ## Pipeline Workflow
