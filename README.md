@@ -50,6 +50,8 @@ data_2026_01/
 - Pixel mask: `pixel_mask.fits`
 - Flats: `{FILTER}_dither{ANGLE}_flat.fits` for each filter (J/H/K) × dither (0/72/144/216/288)
 
+**Note**: A companion calibration notebook (`cal_flat_and_bad_pix.ipynb`) can produce calibration files for user donwloaded flat files — see the notebook header for documentation.
+
 ## Installation
 
 1. Clone or download repository:
@@ -840,7 +842,7 @@ for dir in */; do
 done
 ```
 
-A companion extraction notebook (`extract_lightcurve.py`) can then collect all `*_photometry.txt` files across nights and build a time-sorted light curve — see the notebook header for documentation.
+A companion notebook (`batch_analyes_and_lightcurve.ipynb`) can then collect all `*_photometry.txt` files across nights and build a time-sorted light curve — see the notebook header for documentation.
 
 ## Authors & Credits
 
