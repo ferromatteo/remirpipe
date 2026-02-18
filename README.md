@@ -656,7 +656,7 @@ Standard WCS + SIP distortion keywords added by astropy WCS fitting.
 
 ### Standard Star Zeropoint Comparison
 
-| Classification | |ΔZP| Threshold | Interpretation |
+| Classification | \|ΔZP|\ Threshold | Interpretation |
 |----------------|---------------|----------------|
 | **VERY GOOD** | < 0.05 mag | Excellent agreement |
 | **GOOD** | < 0.10 mag | Good agreement |
