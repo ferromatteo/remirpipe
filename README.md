@@ -705,7 +705,7 @@ Standard WCS + SIP distortion keywords added by astropy WCS fitting.
 - Verify filter name is uppercase: J, H, K (not j, h, k)
 - Confirm `data_folder` path in config is correct
 - Dither angles must be rounded to: 0, 72, 144, 216, 288
-- Create missing flats (see CALIBRATION_CREATION_GUIDE.md)
+- Create missing flats (see `cal_flat_and_bad_pix.ipynb`)
 
 #### Thermal correction not applied
 **Symptoms**: No thermal correction messages in log
