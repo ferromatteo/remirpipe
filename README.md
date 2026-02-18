@@ -866,13 +866,9 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 - Quad matching: Lang et al. 2010 ([AJ 139:1782](https://ui.adsabs.harvard.edu/abs/2010AJ....139.1782L), Astrometry.net)
 - Source extraction: Bertin & Arnouts 1996 ([A&AS 117:393](https://ui.adsabs.harvard.edu/abs/1996A%26AS..117..393B), SExtractor)
 
-## License
-
-[Specify license here]
-
 ## Version History
 
-**v2.0** (2026-02)
+**v1.0** (2026-02)
 - Median sky subtraction from all N frames (simpler, more robust)
 - **Single-pass affine drizzle** for alignment: full rotation + scale + translation
   in one drizzle step, no double interpolation (same principle as AQuA/PREPROCESS)
@@ -882,9 +878,3 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 - Fixed noise model (read noise in correct ADU² units)
 - Enhanced FITS keyword tracking
 - Comprehensive documentation
-
-**v1.0** (2026-01)
-- Initial release
-- Basic calibration pipeline
-- Quad-matching astrometry
-- 2MASS photometric calibration
