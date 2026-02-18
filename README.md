@@ -842,7 +842,7 @@ for dir in */; do
 done
 ```
 
-A companion notebook (`batch_analyes_and_lightcurve.ipynb`) can then collect all `*_photometry.txt` files across nights and build a time-sorted light curve — see the notebook header for documentation.
+A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect all `*_photometry.txt` files across nights and build a time-sorted light curve — see the notebook header for documentation.
 
 ## Authors & Credits
 
