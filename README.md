@@ -869,12 +869,3 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 ## Version History
 
 **v1.0** (2026-02)
-- Median sky subtraction from all N frames (simpler, more robust)
-- **Single-pass affine drizzle** for alignment: full rotation + scale + translation
-  in one drizzle step, no double interpolation (same principle as AQuA/PREPROCESS)
-- Thermal correction with EXPTIME-based linear scaling and diversity gate
-- Processing order: level → sky → flat → thermal
-- Optional alignment refinement via cross-matching + similarity transform
-- Fixed noise model (read noise in correct ADU² units)
-- Enhanced FITS keyword tracking
-- Comprehensive documentation
