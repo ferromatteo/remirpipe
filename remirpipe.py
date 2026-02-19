@@ -1259,16 +1259,21 @@ def validate_groups(groups, verbose=False):
 def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir, verbose=False):
     """Apply thermal residual correction to sky-subtracted files.
     
-    The thermal pattern scales linearly with exposure time.  We build a
-    template at a reference exposure (10 s) and subtract it scaled by each
-    file's actual EXPTIME.
+    The thermal pattern is built from a median stack of all skysub files
+    scaled to a reference exposure (10 s).  For each individual file the
+    scaling coefficient α can either be fixed (EXPTIME / 10) or **fitted
+    per-frame** by least-squares minimisation of the residual.
     
     Algorithm (per filter, dither_angle group):
     1. Collect all skysub files for this (filter, dither_angle)
     2. Scale every file to 10 s equivalent: data_scaled = data × (10 / EXPTIME)
     3. Create thermal template = median(data_scaled)  → pattern at 10 s
     4. Zero-centre the template (remove sky offset)
-    5. For each file compute α = EXPTIME / 10
+    5. For each file compute α:
+       - If fit_alpha=False (legacy): α = EXPTIME / 10
+       - If fit_alpha=True  (default): α = Σ(d·t) / Σ(t²) over source-masked
+         pixels, where d = data, t = template.  Bright sources and outliers
+         are excluded via sigma-clipping before the fit.
     6. Apply: corrected = data − α × template
     7. Update file in place (overwrite)
     
@@ -1286,6 +1291,11 @@ def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir,
     enable_thermal = config.get('calibration', {}).get('enable_thermal_correction', True)
     thermal_filters = config.get('calibration', {}).get('thermal_filters', ['J', 'H', 'K', 'Z'])
     THERMAL_REF_EXPTIME = 10.0  # Reference exposure time [seconds]
+
+    # Per-frame alpha fitting settings from config
+    fit_alpha = config.get('calibration', {}).get('fit_alpha', True)
+    fit_sigma_clip = config.get('calibration', {}).get('fit_alpha_sigma_clip', 3.0)
+    fit_central_fraction = config.get('calibration', {}).get('fit_alpha_central_fraction', 0.8)
 
     # Thermal diversity requirements from config
     thermal_cfg = config.get('calibration', {}).get('thermal_requirements', {})
@@ -1398,7 +1408,20 @@ def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir,
             logging.info(f"  Created thermal template for {filt} dither{dither_angle:03d} "
                         f"from {len(files)} files (ref={THERMAL_REF_EXPTIME}s)")
         
-        # Apply correction to each file: α = EXPTIME / 10
+        # Pre-compute template mask for alpha fitting (central region + finite pixels)
+        if fit_alpha:
+            ny, nx = template_centered.shape
+            margin_y = int(ny * (1 - fit_central_fraction) / 2)
+            margin_x = int(nx * (1 - fit_central_fraction) / 2)
+            central_mask = np.zeros((ny, nx), dtype=bool)
+            central_mask[margin_y:ny - margin_y, margin_x:nx - margin_x] = True
+            tmpl_finite = np.isfinite(template_centered)
+            tmpl_base_mask = central_mask & tmpl_finite
+            tmpl_sq = template_centered ** 2  # pre-compute for fitting
+
+        # Apply correction to each file
+        alpha_fitted_vals = []
+        alpha_expected_vals = []
         for i, sf in enumerate(files):
             if 'data' in sf and sf['data'] is not None:
                 data = sf['data']
@@ -1417,7 +1440,49 @@ def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir,
             exptime = sf['header'].get('EXPTIME', THERMAL_REF_EXPTIME)
             if exptime <= 0:
                 exptime = THERMAL_REF_EXPTIME
-            alpha = exptime / THERMAL_REF_EXPTIME
+            alpha_expected = exptime / THERMAL_REF_EXPTIME
+            
+            if fit_alpha:
+                # --- Per-frame least-squares alpha fitting ---
+                # Minimise || data - α × template ||²  over valid pixels.
+                # Solution: α = Σ(data × template) / Σ(template²)
+                # We mask: NaN pixels, image edges, and bright sources / outliers.
+                
+                data_finite = np.isfinite(data)
+                valid = tmpl_base_mask & data_finite
+                
+                if np.count_nonzero(valid) > 100:
+                    # Iterative sigma-clipping to exclude sources from the fit
+                    d_vals = data[valid]
+                    t_vals = template_centered[valid]
+                    
+                    # Initial fit
+                    alpha_iter = np.nansum(d_vals * t_vals) / np.nansum(t_vals ** 2)
+                    
+                    for _ in range(3):  # 3 sigma-clip iterations
+                        residuals = d_vals - alpha_iter * t_vals
+                        med_res = np.nanmedian(residuals)
+                        mad_res = np.nanmedian(np.abs(residuals - med_res)) * 1.4826
+                        if mad_res < 1e-10:
+                            break
+                        clip_mask = np.abs(residuals - med_res) < fit_sigma_clip * mad_res
+                        if np.count_nonzero(clip_mask) < 100:
+                            break
+                        d_clipped = d_vals[clip_mask]
+                        t_clipped = t_vals[clip_mask]
+                        denom = np.nansum(t_clipped ** 2)
+                        if denom > 0:
+                            alpha_iter = np.nansum(d_clipped * t_clipped) / denom
+                    
+                    alpha = alpha_iter
+                else:
+                    # Not enough valid pixels - fall back to EXPTIME scaling
+                    alpha = alpha_expected
+            else:
+                alpha = alpha_expected
+            
+            alpha_fitted_vals.append(alpha)
+            alpha_expected_vals.append(alpha_expected)
             
             # Apply correction: corrected = data − α × template_10s
             data_corrected = data - alpha * template_centered
@@ -1428,15 +1493,30 @@ def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir,
             # Update file on disk
             with fits.open(sf['path'], mode='update') as hdul:
                 hdul[0].data = data_corrected
-                hdul[0].header['HISTORY'] = (f'Thermal correction: alpha={alpha:.4f} '
-                                             f'(EXPTIME={exptime:.1f}s / ref={THERMAL_REF_EXPTIME:.0f}s)')
-                hdul[0].header['THMALPHA'] = (alpha, 'Thermal correction scaling (EXPTIME/ref)')
+                if fit_alpha:
+                    hdul[0].header['HISTORY'] = (f'Thermal correction: alpha_fit={alpha:.4f} '
+                                                 f'(expected={alpha_expected:.4f} from '
+                                                 f'EXPTIME={exptime:.1f}s / ref={THERMAL_REF_EXPTIME:.0f}s)')
+                else:
+                    hdul[0].header['HISTORY'] = (f'Thermal correction: alpha={alpha:.4f} '
+                                                 f'(EXPTIME={exptime:.1f}s / ref={THERMAL_REF_EXPTIME:.0f}s)')
+                hdul[0].header['THMALPHA'] = (round(float(alpha), 6), 'Thermal correction scaling factor')
+                hdul[0].header['THMEXPCT'] = (round(float(alpha_expected), 6), 'Expected alpha (EXPTIME/ref)')
                 hdul.flush()
             
             total_corrected += 1
         
         if verbose:
-            logging.info(f"    Corrected {len(files)} files for {filt} dither{dither_angle:03d}")
+            if fit_alpha and alpha_fitted_vals:
+                alphas = np.array(alpha_fitted_vals)
+                expecteds = np.array(alpha_expected_vals)
+                deviations = alphas - expecteds
+                logging.info(f"    Corrected {len(files)} files for {filt} dither{dither_angle:03d} "
+                             f"(fit_alpha: mean={np.mean(alphas):.4f}, "
+                             f"mean_deviation={np.mean(deviations):+.4f}, "
+                             f"std_deviation={np.std(deviations):.4f})")
+            else:
+                logging.info(f"    Corrected {len(files)} files for {filt} dither{dither_angle:03d}")
     
     if verbose:
         logging.info(f"  Total thermal corrections applied: {total_corrected}")
@@ -2943,126 +3023,69 @@ def aperture_photometry_with_noise(positions, data_sub, noise_matrix, aperture_r
     return fluxes, flux_errors
 
 
-def compute_limiting_magnitude(sources_data, target_error=0.33):
-    """Compute limiting magnitude by finding where mag_err = target_error.
+def compute_limiting_magnitude(zp, noise_map, aperture_radius, inst_zp=25.0,
+                               target_snr=3.0, central_fraction=0.8):
+    """Compute limiting magnitude from the image noise properties.
     
-    Uses the cumulative distribution of detected sources:
-    1. Sort sources by calibrated magnitude (bright to faint)
-    2. Bin sources by magnitude and compute median error per bin
-    3. Interpolate to find exact magnitude where error = target_error
+    Instead of extrapolating from detected sources (unreliable with few stars),
+    this method estimates the noise in a typical empty-sky aperture directly from
+    the noise map, then converts the flux at the target S/N to a calibrated
+    magnitude.
     
-    This approach is robust because:
-    - Binning averages out individual variations
-    - Median per bin is robust to outliers
-    - Linear interpolation gives precise crossing point
+    Algorithm:
+    1. Estimate the typical per-pixel noise from the central region of the
+       noise map (median, avoiding edges and masked pixels)
+    2. Compute the noise in a circular aperture: σ_aper = σ_pix × √(N_pix)
+       where N_pix = π × r²
+    3. The faintest detectable flux at target S/N: F_lim = target_snr × σ_aper
+    4. Convert to calibrated magnitude: mag_lim = (inst_zp - 2.5·log10(F_lim)) + zp
     
     Args:
-        sources_data: List of dicts with 'mag_cal', 'e_mag_cal', 'flag'
-        target_error: Target magnitude error (default 0.33 mag ≈ 3σ detection)
+        zp: Photometric zero point (calibrated - instrumental)
+        noise_map: 2D noise (RMS) map combining all noise sources
+                   (Poisson + read noise + sky subtraction + background estimation)
+        aperture_radius: Aperture radius in pixels
+        inst_zp: Instrumental zero point (default 25.0)
+        target_snr: Signal-to-noise ratio defining the limit (default 3.0 ≈ 0.36 mag error)
+        central_fraction: Fraction of image used for noise estimation (default 0.8)
     
     Returns:
-        mag_lim: Limiting magnitude where error = target_error, or 99.0 if failed
+        mag_lim: Limiting magnitude, or 99.0 if computation fails
     """
-    if not sources_data or len(sources_data) < 5:
+    if noise_map is None or zp is None:
         return 99.0
     
-    # Extract all sources with valid photometry (not just flag=0, to have more statistics)
-    all_sources = []
-    for src in sources_data:
-        mag = src.get('mag_cal', 99.0)
-        err = src.get('e_mag_cal', 99.0)
-        if np.isfinite(mag) and np.isfinite(err) and err > 0 and err < 2.0 and mag < 90:
-            all_sources.append((mag, err))
-    
-    if len(all_sources) < 5:
-        return 99.0
-    
-    # Sort by magnitude (bright to faint)
-    all_sources.sort(key=lambda x: x[0])
-    mags = np.array([s[0] for s in all_sources])
-    errs = np.array([s[1] for s in all_sources])
-    
-    # Create magnitude bins (0.5 mag width)
-    mag_min = np.floor(mags.min() * 2) / 2  # Round down to 0.5
-    mag_max = np.ceil(mags.max() * 2) / 2   # Round up to 0.5
-    bin_width = 0.5
-    
-    bin_edges = np.arange(mag_min, mag_max + bin_width, bin_width)
-    
-    if len(bin_edges) < 3:
-        # Not enough range, use direct interpolation on sorted data
-        # Find where error crosses target
-        for i in range(len(mags) - 1):
-            if errs[i] < target_error <= errs[i + 1]:
-                frac = (target_error - errs[i]) / (errs[i + 1] - errs[i])
-                return float(mags[i] + frac * (mags[i + 1] - mags[i]))
-        # Extrapolate if needed
-        if errs[-1] < target_error:
-            return float(mags[-1] + 0.5)
-        return float(mags[0])
-    
-    # Compute median error per bin
-    bin_centers = []
-    bin_median_errs = []
-    
-    for i in range(len(bin_edges) - 1):
-        mask = (mags >= bin_edges[i]) & (mags < bin_edges[i + 1])
-        if np.sum(mask) >= 2:  # At least 2 sources per bin
-            bin_centers.append((bin_edges[i] + bin_edges[i + 1]) / 2)
-            bin_median_errs.append(np.median(errs[mask]))
-    
-    if len(bin_centers) < 2:
-        # Fallback: use faintest detected
-        return float(mags[-1])
-    
-    bin_centers = np.array(bin_centers)
-    bin_median_errs = np.array(bin_median_errs)
-    
-    # Find crossing point where median error = target_error
-    for i in range(len(bin_centers) - 1):
-        err_lo = bin_median_errs[i]
-        err_hi = bin_median_errs[i + 1]
-        mag_lo = bin_centers[i]
-        mag_hi = bin_centers[i + 1]
+    try:
+        ny, nx = noise_map.shape
         
-        # Check if target_error is between these two bins
-        if err_lo < target_error <= err_hi:
-            # Linear interpolation
-            frac = (target_error - err_lo) / (err_hi - err_lo)
-            mag_lim = mag_lo + frac * (mag_hi - mag_lo)
-            return float(mag_lim)
-        elif err_hi < target_error <= err_lo:
-            # Decreasing (unusual but handle it)
-            frac = (target_error - err_hi) / (err_lo - err_hi)
-            mag_lim = mag_hi + frac * (mag_lo - mag_hi)
-            return float(mag_lim)
-    
-    # If we reach here, target_error is outside the range of binned errors
-    # Extrapolate using last few bins
-    if bin_median_errs[-1] < target_error:
-        # Need to extrapolate to fainter magnitudes
-        # Fit log(err) vs mag on last few bins
-        n_fit = min(4, len(bin_centers))
-        try:
-            coeffs = np.polyfit(bin_centers[-n_fit:], np.log10(bin_median_errs[-n_fit:]), 1)
-            slope, intercept = coeffs
-            if slope > 0:
-                # log10(target_error) = intercept + slope * mag_lim
-                mag_lim = (np.log10(target_error) - intercept) / slope
-                # Sanity check: should be fainter than last bin but not crazy
-                if mag_lim > bin_centers[-1] and mag_lim < bin_centers[-1] + 3.0:
-                    return float(mag_lim)
-        except:
-            pass
-        # Fallback
-        return float(mags[-1] + 0.5)
-    
-    if bin_median_errs[0] > target_error:
-        # Even brightest bin has error > target (unusual)
-        return float(bin_centers[0])
-    
-    # Fallback
-    return float(mags[-1])
+        # Use central region to avoid noisy edges / vignetted corners
+        margin_y = int(ny * (1 - central_fraction) / 2)
+        margin_x = int(nx * (1 - central_fraction) / 2)
+        central = noise_map[margin_y:ny - margin_y, margin_x:nx - margin_x]
+        
+        # Median per-pixel noise (robust to outliers / source residuals)
+        sigma_pixel = np.nanmedian(central)
+        
+        if sigma_pixel <= 0 or not np.isfinite(sigma_pixel):
+            return 99.0
+        
+        # Noise in a circular aperture (assuming uncorrelated pixels)
+        n_pix = np.pi * aperture_radius ** 2
+        sigma_aperture = sigma_pixel * np.sqrt(n_pix)
+        
+        # Flux at the detection limit
+        f_lim = target_snr * sigma_aperture
+        
+        if f_lim <= 0:
+            return 99.0
+        
+        # Calibrated limiting magnitude
+        mag_lim = inst_zp - 2.5 * np.log10(f_lim) + zp
+        
+        return float(mag_lim)
+        
+    except Exception:
+        return 99.0
 
 
 def match_detections_to_catalog(det_positions, cat_positions, tolerance):
@@ -3602,12 +3625,15 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         
         sources_data.append(src)
     
-    # Compute limiting magnitude from mag error vs mag relation
-    # Extrapolates to mag_err = 0.33 (3σ detection threshold)
-    mag_lim = compute_limiting_magnitude(sources_data, target_error=0.33)
+    # Compute limiting magnitude from image noise properties
+    # Uses the noise map + ZP to estimate the faintest detectable source at S/N=3
+    mag_lim = compute_limiting_magnitude(
+        zp, photometry_noise, fixed_aperture,
+        inst_zp=inst_zp, target_snr=3.0
+    )
     
     if verbose:
-        logging.info(f"    Limiting magnitude (mag_err=0.33): {mag_lim:.2f} mag")
+        logging.info(f"    Limiting magnitude (S/N=3): {mag_lim:.2f} mag")
     
     # Save photometry catalog with all parameters
     catalog_txt_path = os.path.join(output_dir, filename.replace('.fits', '_photometry.txt'))

@@ -169,7 +169,7 @@ The pipeline executes these steps automatically:
    - Apply flat: `data_final[i] = data_skysub[i] / flat[i]`
    - Save: `originalname[i]_skysub.fits` (DITHID=original, PSTATSUB=2)
 
-5. **Thermal residual correction** (post-processing, linear EXPTIME scaling)
+5. **Thermal residual correction** (post-processing, per-frame fitted scaling)
    - Group all skysub files by (filter, dither_angle)
    - **Diversity gate** (must pass both to proceed):
      - ≥ 10 files in the group (configurable `thermal_requirements.min_files`)
@@ -177,9 +177,15 @@ The pipeline executes these steps automatically:
    - Scale each file to 10 s reference: `data_scaled = data × (10 / EXPTIME)`
    - Create template: `thermal_template = median(data_scaled)` (pattern at 10 s)
    - Zero-center: `template_centered = template - median(template)`
-   - For each file: `α = EXPTIME / 10`
+   - For each file, **fit α by least-squares** (default, `fit_alpha: true`):
+     - Mask image edges (central 80%, configurable `fit_alpha_central_fraction`)
+     - Iterative σ-clipping (3 iterations, configurable `fit_alpha_sigma_clip`) to exclude bright sources
+     - `α_fit = Σ(data × template) / Σ(template²)` over valid pixels
+     - Falls back to `α = EXPTIME / 10` if insufficient valid pixels
+   - Legacy mode (`fit_alpha: false`): fixed `α = EXPTIME / 10`
    - Apply: `corrected = data − α × template`
-   - **THMALPHA** keyword records the scaling factor (`EXPTIME / 10`)
+   - **THMALPHA** keyword records the fitted scaling factor
+   - **THMEXPCT** keyword records the expected value (`EXPTIME / 10`) for comparison
 
 **Processing formula**: `data_final = (data_raw × level_factor - sky_all) / flat - α × thermal`
 
@@ -303,7 +309,9 @@ The pipeline executes these steps automatically:
    - Rejection quality: fraction of stars rejected
 
 5. **Limiting magnitude**
-   - Interpolates where instrumental magnitude error = 0.33 mag (≈3σ detection) in the source catalog
+   - Computed from the image noise map: `mag_lim = ZP_inst − 2.5·log10(3 × σ_pix × √(π r²)) + ZP`
+   - `σ_pix` = median per-pixel noise in the central 80% of the combined noise map (FITS noise ⊕ SEP bkg RMS)
+   - Independent of number of detected sources — depends only on image depth and calibration
 
 6. **Diagnostic outputs**
    - Photometry catalog: `*_photometry.txt` (all detected sources + matches + calibrated magnitudes)
@@ -866,6 +874,25 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 - Quad matching: Lang et al. 2010 ([AJ 139:1782](https://ui.adsabs.harvard.edu/abs/2010AJ....139.1782L), Astrometry.net)
 - Source extraction: Bertin & Arnouts 1996 ([A&AS 117:393](https://ui.adsabs.harvard.edu/abs/1996A%26AS..117..393B), SExtractor)
 
+## License
+
+[Specify license here]
+
 ## Version History
 
-**v1.0** (2026-02)
+**v2.0** (2026-02)
+- Median sky subtraction from all N frames (simpler, more robust)
+- **Single-pass affine drizzle** for alignment: full rotation + scale + translation
+  in one drizzle step, no double interpolation (same principle as AQuA/PREPROCESS)
+- Thermal correction with EXPTIME-based linear scaling and diversity gate
+- Processing order: level → sky → flat → thermal
+- Optional alignment refinement via cross-matching + similarity transform
+- Fixed noise model (read noise in correct ADU² units)
+- Enhanced FITS keyword tracking
+- Comprehensive documentation
+
+**v1.0** (2026-01)
+- Initial release
+- Basic calibration pipeline
+- Quad-matching astrometry
+- 2MASS photometric calibration

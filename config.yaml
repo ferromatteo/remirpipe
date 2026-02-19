@@ -48,9 +48,14 @@ calibration:
   
   # 3) Thermal residual correction - post-processing after sky subtraction
   # Scales all skysub files to 10s reference, takes median → thermal template
-  # Applies template scaled by EXPTIME/10 (linear thermal assumption)
+  # For each file, α is fitted per-frame (least-squares) or fixed (EXPTIME/10)
   enable_thermal_correction: true    # Apply thermal residual correction
   thermal_filters: [K]      # Filters for thermal residual correction
+  
+  # Per-frame alpha fitting (recommended: captures non-linear thermal scaling)
+  fit_alpha: true                    # true = least-squares fit per frame, false = legacy EXPTIME/10
+  fit_alpha_sigma_clip: 3.0          # Sigma-clipping threshold for source masking during fit
+  fit_alpha_central_fraction: 0.8    # Central fraction of image used for fitting (avoids edges)
   
   # Thermal correction diversity requirements
   # The template is reliable only when built from many files spanning
