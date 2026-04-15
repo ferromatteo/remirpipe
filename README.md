@@ -509,7 +509,7 @@ See `config.yaml` for the complete parameter reference with inline comments.
 
 ### ZP Comparison (Standard Stars)
 
-| Classification | |ΔZP| [mag] |
+| Classification | |DZP| [mag] |
 |----------------|-------------|
 | VERY GOOD | < 0.05 |
 | GOOD | < 0.10 |
