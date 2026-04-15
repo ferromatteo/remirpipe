@@ -604,22 +604,6 @@ This uses leave-one-out sky subtraction (breaking the arc correlation) followed 
    ds9 data_2026_01/pixel_mask.fits
    ```
 
-## Performance
-
-Typical processing times (approximate, single-core):
-
-| Step | Time per... | Notes |
-|------|-------------|-------|
-| File preparation | ~0.5-1 sec/file | Gunzip + header fixes |
-| Sky subtraction | ~3-5 sec/group | N=5 dithers (standard mode) |
-| Sky subtraction (LOO+IG) | ~15-25 sec/group | LOO + 3 IterGauss iterations per frame |
-| Alignment | ~2-3 sec/coadd | Drizzling algorithm |
-| Co-addition | ~1-2 sec/coadd | Inverse-variance weighted |
-| Astrometry | ~2-10 sec/coadd | Varies with attempts |
-| Photometry | ~2-5 sec/coadd | Source detection + matching |
-
-**Total**: ~20-30 seconds per observation block (5 dithers → 1 co-add)
-
 ## Pipeline Statistics
 
 At completion, the pipeline reports:
