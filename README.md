@@ -1,18 +1,21 @@
 # REMIR Pipeline
 
-Complete automated reduction and analysis pipeline for REMIR (REM InfraRed) near-infrared imaging data.
+Automated reduction and calibration pipeline for REMIR (REM InfraRed) near-infrared imaging data from the REM telescope at La Silla Observatory.
 
 ## Overview
 
-The REMIR pipeline performs end-to-end processing of NIR imaging data from raw FITS files through calibration, alignment, co-addition, astrometric calibration, and photometric calibration. Designed for dithered observations in J, H, and K bands with the REM telescope's rotating wedge prism dither system.
+End-to-end processing of dithered NIR observations (J, H, K bands) from raw FITS files through sky subtraction, alignment, co-addition, astrometric calibration, and photometric calibration.
 
-**Key Features:**
-- Median sky subtraction from all dithered frames
-- Thermal pattern correction (EXPTIME-proportional scaling)
-- Drizzling algorithm for flux-preserving alignment
-- Inverse-variance weighted co-addition with optimal noise propagation
-- Quad-matching astrometry with 2MASS catalog
-- Automated photometric calibration and quality assessment
+**Key features:**
+- Median sky subtraction with post-median residual cleanup for clean skies in crowded fields
+- Optional LOO + Iterative Gaussian mode for thermal wedge-prism arc removal (K band)
+- Flux-preserving drizzle alignment with optional cross-match refinement
+- Inverse-variance weighted co-addition with sigma clipping
+- Quad-matching astrometry against 2MASS catalog
+- Iterative source detection with deblending and residual re-extraction for crowded fields
+- Automated photometric calibration with quality assessment and limiting magnitude
+- Forced aperture photometry at user-specified target positions (`-f` flag)
+- Target position overlay on detection maps (`-f` flag)
 
 ## Requirements
 
@@ -22,535 +25,399 @@ The REMIR pipeline performs end-to-end processing of NIR imaging data from raw F
 pip install numpy scipy astropy photutils matplotlib pyyaml pandas sep requests
 ```
 
-**Required packages:**
-- `numpy` ≥ 1.20 - Array operations and linear algebra
-- `scipy` ≥ 1.7 - Spatial operations (cKDTree for matching)
-- `astropy` ≥ 5.0 - FITS I/O, WCS, coordinates, time handling
-- `photutils` ≥ 1.5 - Aperture photometry
-- `sep` ≥ 1.2 - Source Extraction and Photometry (SExtractor in Python)
-- `matplotlib` ≥ 3.5 - Diagnostic plots and preview generation
-- `pyyaml` ≥ 6.0 - Configuration file parsing
-- `pandas` ≥ 1.3 - Catalog handling and table operations
-- `requests` - HTTP catalog downloads (2MASS, VSX)
+| Package | Min Version | Purpose |
+|---------|-------------|---------|
+| `numpy` | 1.20 | Array operations, linear algebra |
+| `scipy` | 1.7 | cKDTree matching, Gaussian filtering |
+| `astropy` | 5.0 | FITS I/O, WCS, coordinates, time |
+| `photutils` | 1.5 | Aperture photometry |
+| `sep` | 1.2 | Source Extraction (SExtractor backend) |
+| `matplotlib` | 3.5 | Diagnostic plots, detection maps |
+| `pyyaml` | 6.0 | Configuration parsing |
+| `pandas` | 1.3 | Catalog handling |
+| `requests` | — | HTTP catalog downloads |
 
 ### Calibration Files
 
-Place calibration files in the `data_folder` directory (configured in `config.yaml`, default: `data_2026_01/`):
+Place in the `data_folder` directory (configured in `config.yaml`, default: `data_2026_01/`):
 
 ```
 data_2026_01/
-├── pixel_mask.fits                          # Bad pixel mask (0=bad, 1=good)
-├── J_dither0_flat.fits                      # Master flat fields
-├── J_dither72_flat.fits                     # (per filter × dither angle)
+├── pixel_mask.fits              # Bad pixel mask (0=bad, 1=good)
+├── J_dither0_flat.fits          # Master flat fields
+├── J_dither72_flat.fits         # (per filter × dither angle)
 ├── J_dither144_flat.fits
+├── H_dither0_flat.fits
 └── ...
 ```
 
-**Required:**
-- Pixel mask: `pixel_mask.fits`
-- Flats: `{FILTER}_dither{ANGLE}_flat.fits` for each filter (J/H/K) × dither (0/72/144/216/288)
+- **Pixel mask**: `pixel_mask.fits` — binary mask, 0=bad, 1=good
+- **Flats**: `{FILTER}_dither{ANGLE}_flat.fits` for each filter (J/H/K) × dither angle (0/72/144/216/288)
 
-**Note**: A companion calibration notebook (`cal_flat_and_bad_pix.ipynb`) can produce calibration files for user donwloaded flat files — see the notebook header for documentation.
+A companion notebook (`cal_flat_and_bad_pix.ipynb`) can produce calibration files from raw flat observations.
 
 ## Installation
 
-1. Clone or download repository:
 ```bash
 git clone https://github.com/ferromatteo/remirpipe.git
 cd remirpipe
-```
-
-2. Install dependencies:
-```bash
 pip install -r requirements.txt
 ```
 
-3. Prepare calibration files (pixel mask + master flats)
-
-4. Edit `config.yaml` to match your setup (data paths, processing parameters)
+Then prepare calibration files and edit `config.yaml` for your setup.
 
 ## Usage
 
 ### Basic Command
 
 ```bash
-python remirpipe.py -i /path/to/raw/data -o /path/to/output -v
+python remirpipe.py -i /path/to/raw/data -v
 ```
 
 ### Command-Line Options
 
-```
-Required:
-  -i, --input DIR          Input directory with raw FITS files
-
-Optional:
-  -o, --output DIR         Output directory (default: same as input)
-  -c, --config FILE        Configuration file (default: config.yaml)
-  -v, --verbose            Verbose output to console and log
-  -d, --delete-tmp         Delete tmp/ directory after completion
-  -s, --scale-constraint   Apply strict scale limits (0.95-1.05) for astrometry
-  -co, --clean-output      Clean existing output directories before starting
-  -t, --target NAME [NAME ...]
-                           Target OBJECT name(s): all data are processed but
-                           astrometry/photometry runs only on matching OBJECTs
-```
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-i`, `--input` | Input directory with raw FITS files | **required** |
+| `-o`, `--output` | Output directory | same as input |
+| `-c`, `--config` | Configuration YAML file | `config.yaml` (script dir) |
+| `-v`, `--verbose` | Verbose output to console and log | off |
+| `-d`, `--delete-tmp` | Delete `tmp/` directory after completion | off |
+| `-s`, `--scale-constraint` | Enforce scale ∈ [0.95, 1.05] for astrometry | off |
+| `-co`, `--clean-output` | Clean existing output directories before starting | off |
+| `-t`, `--target` | Target OBJECT name(s) — astrometry/photometry only on these | all |
+| `-f`, `--target-file` | Text file with target positions (RA DEC radius_arcsec) | none |
 
 ### Examples
 
-**Standard processing with verbose logging:**
 ```bash
+# Standard reduction with verbose logging
 python remirpipe.py -i ./raw_data/2026-01-15 -v
-```
 
-**Custom configuration and clean start:**
-```bash
+# Custom config, clean start, separate output
 python remirpipe.py -i ./data -o ./reduced -c custom.yaml -co -v
-```
 
-**Strict astrometry with cleanup:**
-```bash
+# Strict astrometry with cleanup
 python remirpipe.py -i ./data -s -d -v
+
+# Process all data, astrometry/photometry only on specific targets
+python remirpipe.py -i ./data -t NGC1234 M31 -v
+
+# Target overlay on detection maps
+python remirpipe.py -i ./data -f targets.txt -v
 ```
 
-**Process all data but run astrometry/photometry only on specific targets:**
-```bash
-python remirpipe.py -i ./data -t NGC1234 M31 -v
+### Target Position File Format (`-f`)
+
+Plain text file with one target per line: `RA DEC radius_arcsec`
+
+Supports both sexagesimal and decimal degree formats:
 ```
+13:58:09.72 -64:44:05.26 1.5
+209.540500  -64.734794   2.0
+```
+
+When provided, the detection map PNG for each image marks each target position with a cyan cross and error circle. If a source is detected within the error radius, it is highlighted with its calibrated magnitude; otherwise the limiting magnitude is shown.
 
 ## Pipeline Workflow
 
-The pipeline executes these steps automatically:
-
 ### 1. File Preparation
 
-- **Decompress**: Gunzip `.fits.gz` files in-place
-- **Filter**: Remove files with DITHID=98 or DITHID=99 (pipeline products from previous runs)
-- **Fix headers**: Repair invalid values (e.g., NaN in WINDDIR)
-- **Add keywords**: FILENAME, PROCTYPE (0=FLAT, 1=STD, 2=SCI, -1=FOCUS)
-- **Mask bad pixels**: Apply pixel_mask.fits (sets masked pixels to NaN)
+- Gunzip `.fits.gz` files in-place
+- Remove files with DITHID=98 or 99 (products from previous runs)
+- Fix invalid header values (e.g., NaN in WINDDIR)
+- Add keywords: FILENAME, PROCTYPE (0=FLAT, 1=STD, 2=SCI, -1=FOCUS)
+- Apply bad pixel mask (sets masked pixels to NaN)
 
 ### 2. File Classification
 
 - Classify by dither system: **old** (pre-2025, DWANGLE) vs **new** (post-2025, DITHANGL)
-- Route files:
-  - FLAT/FOCUS → directly to `reduced/`
-  - SCI/STD → to `tmp/old/` or `tmp/new/` for processing
+- FLAT/FOCUS → directly to `reduced/`
+- SCI/STD → to `tmp/old/` or `tmp/new/` for processing
 
 ### 3. Grouping & Validation
 
-- Group by: OBJECT + FILTER + OBSID + SUBID + time gap < 9 hours (configurable)
-- Validate dither completeness:
-  - **Complete**: N files = NDITHERS (typically 5)
-  - **Incomplete**: 3 ≤ N < NDITHERS (processable)
-  - **Defective**: N < 3 or N > NDITHERS (skipped)
+- Group by: OBJECT + FILTER + OBSID + SUBID + time gap < 9 hours
+- **Complete**: N = NDITHERS (typically 5) — full processing
+- **Incomplete**: 3 ≤ N < NDITHERS — processable with flag
+- **Defective**: N < 3 or N > NDITHERS — skipped
 
-### 4. Calibration & Sky Subtraction
+### 4. Sky Subtraction
 
-**Processing order** (per group of N dithered frames):
+Per group of N dithered frames:
 
-1. **Load raw masked data**
-   - All frames already have pixel mask applied during file preparation
+1. **Level normalization**: Scale each frame so its central-region σ-clipped median equals the group mean median
+2. **Median sky**: Pixel-wise median of all N leveled frames — no per-frame source masking (the median naturally rejects dithered stars)
+3. **Post-median residual cleanup**: Detect surviving positive residuals in the sky (from bright stars that weren't fully rejected by the median), replace contaminated pixels by random draws from a clean annular neighborhood (5–15 px), preserving local noise statistics
+4. **Sky subtraction + flat fielding**: `data_final = (data_leveled − sky) / flat`
 
-2. **Level normalization**
-   - For each frame *i*: compute *median* of central 80% region (σ-clipped)
-   - Calculate mean of all medians: `mean_level = mean([med[0], med[1], ..., med[N-1]])`
-   - Scale all frames: `data_leveled[i] = data_raw[i] × (mean_level / med[i])`
-   - Scale noise identically: `noise_leveled[i] = noise_raw[i] × (mean_level / med[i])`
-   - **Purpose**: Equalize background levels before sky creation (removes large-scale variations)
+**Processing formula**: `data_final = (data_raw × level_factor − sky_all) / flat`
 
-3. **Single sky pattern creation**
-   - Use ALL N leveled frames (not leave-one-out)
-   - Compute pixel-wise median: `sky_pattern = median([data_leveled[0], ..., data_leveled[N-1]])`
-   - Save: `{OBJECT}_{OBSID}_{SUBID}_{FILTER}_sky.fits` (DITHID=98, PSTATSUB=1)
+#### LOO + Iterative Gaussian Mode (optional, per-filter)
 
-4. **Sky subtraction and flat fielding**
-   - Sky subtract: `data_skysub[i] = data_leveled[i] - sky_pattern`
-   - Load flat matching (filter, dither angle)
-   - Apply flat: `data_final[i] = data_skysub[i] / flat[i]`
-   - Save: `originalname[i]_skysub.fits` (DITHID=original, PSTATSUB=2)
+When `sky_subtraction.loo_iterative_gauss.enabled: true` (per-filter override via `filter_enable`):
 
-5. **Thermal residual correction** (post-processing, per-frame fitted scaling)
-   - Group all skysub files by (filter, dither_angle)
-   - **Diversity gate** (must pass both to proceed):
-     - ≥ 10 files in the group (configurable `thermal_requirements.min_files`)
-     - ≥ 3 unique sky pointings separated by ≥ 10″ each (configurable `min_positions` / `min_separation_arcsec`)
-   - Scale each file to 10 s reference: `data_scaled = data × (10 / EXPTIME)`
-   - Create template: `thermal_template = median(data_scaled)` (pattern at 10 s)
-   - Zero-center: `template_centered = template - median(template)`
-   - For each file, **fit α by least-squares** (default, `fit_alpha: true`):
-     - Mask image edges (central 80%, configurable `fit_alpha_central_fraction`)
-     - Iterative σ-clipping (3 iterations, configurable `fit_alpha_sigma_clip`) to exclude bright sources
-     - `α_fit = Σ(data × template) / Σ(template²)` over valid pixels
-     - Falls back to `α = EXPTIME / 10` if insufficient valid pixels
-   - Legacy mode (`fit_alpha: false`): fixed `α = EXPTIME / 10`
-   - Apply: `corrected = data − α × template`
-   - **THMALPHA** keyword records the fitted scaling factor
-   - **THMEXPCT** keyword records the expected value (`EXPTIME / 10`) for comparison
+1. **Leave-one-out sky**: For each frame *i*, sky = median of the other N−1 frames (avoids self-subtraction of the thermal arc)
+2. **Flat fielding** as normal
+3. **Iterative Gaussian background removal** (3 iterations by default):
+   - Source mask built once (SEP, threshold = `source_sigma` × σ, ellipse growth = `source_grow_base` px)
+   - Each iteration *k*: σ_gauss = `base_sigma × decay^k` (default: 25.0 × 0.8^k → 25.0, 20.0, 16.0 px)
+   - Background estimated via normalized convolution (handles masked pixels) and subtracted
+   - Progressively removes large-scale to fine-scale residual structure
 
-**Processing formula**: `data_final = (data_raw × level_factor - sky_all) / flat - α × thermal`
+**Noise propagation**: LOO sky noise, flat division noise, and IterGauss smoothing variance are all propagated analytically (~1% total noise increase for default parameters).
 
 ### 5. Alignment
 
-- **Geometric shifts**: Calculate from dither wedge angle + calibrated parameters
-- **Optional refinement**: Cross-match sources between frames, fit **similarity transform** (rotation + scale + translation) using least-squares with:
-  - **Flux-weighted fitting**: bright stars (good centroids) dominate the fit
-  - **3σ sigma-clipping**: outlier matches rejected iteratively
-  - **Iterative re-matching**: after first fit, re-project sources through the transform and re-match with tighter tolerance, recovering borderline matches
-  - **Source capping**: only brightest 50 sources used (avoids noise from faint detections)
-  - SEP deblending overflow handled gracefully (`set_sub_object_limit(4096)`)
-  - **Fallback**: configurable (`fallback_to_blind`) — when refinement fails, either use blind dither geometry or skip alignment entirely
-- **Single-pass affine drizzle**:
-  - Full rotation + scale + translation applied in one drizzle pass (no double interpolation)
-  - Flux-conserving alignment based on geometric pixel overlap
-  - Same principle as AQuA/PREPROCESS's polygon-intersection remapping
-  - Preserves image sharpness (no interpolation smoothing kernel)
-  - Configurable pixfrac (default: 0.8 for ~10% sharper PSF)
-- Save aligned frames: `originalname[i]_skysub_aligned.fits` (PSTATSUB=3)
+- **Geometric shifts**: Calculated from dither wedge angle + calibrated parameters
+- **Optional refinement** (enabled by default): Cross-match sources between frames via displacement voting, then fit via:
+  - **`similarity`** (default): Full similarity transform (rotation + scale + translation, 4 parameters)
+  - **`shift`**: Pure translation (2 parameters) — use when inter-frame rotation is negligible
+  - Iterative sigma-clipped matching with rescue mechanism (widens tolerance on failure)
+  - Capped to brightest 50 sources
+  - Configurable fallback to blind geometry
+- **Drizzle**: Single-pass flux-preserving resampling based on geometric pixel overlap (pixfrac=0.8 default)
 
 ### 6. Co-addition
 
-- **Inverse-variance weighted mean** of aligned frames: `coadd = Σ(data_i / σ_i²) / Σ(1 / σ_i²)`
-- **Optimal noise**: `noise = √(1 / Σ(1 / σ_i²))`
-- Drizzle-edge pixels with higher noise are automatically down-weighted
-- No outlier rejection is applied (cosmic rays may propagate)
-- **Output**: `OBJECT_OBSID_SUBID_FILTER.fits` (DITHID=99, PSTATSUB=4), includes WEIGHT extension
-- **Header keywords**:
-  - `EXPTIME`: Total exposure time (sum of all frames)
-  - `NCOADD`: Number of coadded frames
-  - `INCOMP`: 1 if incomplete dither sequence, 0 if complete
-
-**S/N improvement**: √N for N frames (optimal via inverse-variance weighting)
+- **Inverse-variance weighted mean**: `coadd = Σ(data_i / σ_i²) / Σ(1 / σ_i²)`
+- **Sigma clipping**: Reject pixels > 4σ from weighted mean (2 iterations, requires ≥3 frames)
+- **Output**: FITS with NOISE and WEIGHT extensions
 
 ### 7. Catalog Download
 
-- Query **2MASS Point Source Catalog** via INAF service:
-  - Cone search around image center (default: 10 arcmin radius)
-  - Columns: RAJ2000, DEJ2000, Jmag, Hmag, Kmag + errors
-  - Exponential backoff retry on network failures (configurable retries)
-- Query **VSX** (Variable Star Index):
-  - Same cone search
-  - Cross-match variables with 2MASS (0.5″ tolerance, configurable)
-- Cache catalogs: `catalogs/catalog_{RA}_{DEC}.csv`
-- **Grouping**: Images within 1 arcmin share same catalog (configurable `grouping_tolerance_arcmin`)
-- **Target filtering** (`-t`): When target names are specified, catalogs are only downloaded for coadds whose OBJECT matches the target list. Non-matching coadds skip catalog download entirely.
+- **2MASS PSC** via INAF service (cone search, 10′ default radius, with retries)
+- **VSX** (Variable Star Index) cross-matched with 2MASS (0.5″ tolerance)
+- Cached per position; images within 1′ share the same catalog
+- With `-t`: catalogs only downloaded for matching OBJECTs
 
 ### 8. Astrometric Calibration
 
-**Quad-matching algorithm**:
+**Quad-matching algorithm:**
 
-1. **Source detection** (SEP/SExtractor backend)
-   - Try multiple parameter combinations: min_pixels=[10,5], threshold=[2.0,1.2]
-   - Extract brightest N sources (default: 25)
-   - Iterative background estimation for crowded fields (configurable `n_iter`, `iter_mask_scale`)
+1. **Source detection** — Iterative SEP background refinement (3 iterations with source masking), deblending (`deblend_nthresh=64`, `deblend_cont=0.005`), residual re-extraction for faint sources near bright neighbors. Tries multiple parameter combinations: min_pixels=[10,5], threshold=[2.0,1.2].
+2. **Geometric quad generation** — ~2500 quads from brightest 25 detected + 25 catalog sources
+3. **Quad matching** — Euclidean distance on 4D hash codes (threshold: 0.05)
+4. **Transform consensus** — Group similar transforms by scale/rotation/translation, merge nearby groups, rank by `n_matches − RMS_weight × RMS`
+5. **Validation** — match_fraction ≥ 12% AND RMS ≤ 1.5 px (optional scale enforcement with `-s`)
+6. **WCS fitting** — TAN projection + SIP distortion (degree 2)
+7. **Fallback** — Try alternative catalog filters (filter_fallback), optional reflection
 
-2. **Geometric quad generation**
-   - Build ~2500 quads from detected sources
-   - Build ~2500 quads from catalog sources
-   - Encode quad geometry as hash (4 invariant codes)
-
-3. **Quad matching**
-   - Match detection quads → catalog quads by geometric similarity
-   - Threshold: 0.05 (configurable)
-
-4. **Transform consensus**
-   - Group similar transforms by scale/rotation/translation (configurable bin sizes)
-   - Merge nearby groups (configurable merge thresholds)
-   - Rank by score: `n_matches - rank_rms_weight × RMS`
-   - Select best-scoring group
-
-5. **Validation**
-   - Check: match_fraction ≥ 12% AND RMS ≤ 1.5 pixels
-   - Optional: enforce scale ∈ [0.95, 1.05] with `-s` flag
-
-6. **WCS fitting**
-   - Fit TAN projection + SIP distortion (default degree 2, configurable)
-   - Update FITS header with WCS keywords
-
-7. **Fallback**
-   - Try reflection (flip image) if normal orientation fails (configurable `try_reflection`)
-   - Try alternative catalog filters (e.g., H-band for J-band image)
-
-8. **Filter skipping**
-   - Filters in `skip_filters` list (e.g., GRISM, H2) bypass astrometry entirely
-   - These coadds and their aligned frames are copied to `reduced/` as-is
-
-9. **Target filtering** (`-t`)
-   - When `-t` is used, only coadds whose OBJECT header matches the given target(s) undergo astrometry and photometry
-   - Non-matching coadds and their aligned frames are saved to `reduced/` without astrometric/photometric calibration
-   - All earlier processing steps (sky subtraction, alignment, coadding) run on every file regardless of `-t`
-
-**Output**: WCS-calibrated FITS in `reduced/` directory with `_astro.fits` suffix (e.g., `OBJECT_OBSID_SUBID_FILTER_astro.fits`). Files that fail astrometry are copied without the `_astro` suffix.
-
-**Note**: The same WCS solution is applied to both the coadd and all its individual aligned frames. Each aligned frame is also saved to `reduced/` with the coadd's WCS (as `*_skysub_aligned_astro.fits`).
+**Output**: `*_astro.fits` in `reduced/`. Same WCS applied to all aligned frames of the group.
 
 ### 9. Photometric Calibration
 
-**Automatic zeropoint fitting**:
+**Automatic zeropoint fitting:**
 
-1. **Source detection** (fixed parameters)
-   - Threshold: 1.2σ, min_pixels: 5
-   - Aperture photometry: 3.0 pixel radius (fixed for all sources)
-   - Noise model: `total_noise = √(FITS_noise² + SEP_bkg_rms²)` combining propagated pipeline noise with local background uncertainty
+1. **Source detection** — Fixed parameters: 1.2σ threshold, 5 min pixels, 3 px aperture radius. Same iterative SEP + residual re-extraction as astrometry.
+2. **Source filtering** — Central 90% of image, isolation ≥ 6 px, ellipticity < 0.4, size within 3σ of stellar locus, SEP flag = 0, exclude VSX variables
+3. **Zeropoint** — Weighted mean of `mag_catalog − mag_instrumental` with iterative worst-outlier rejection (target RMS: 0.15 mag)
+4. **Limiting magnitude** — `mag_lim = ZP_inst − 2.5·log10(3σ × √(πr²)) + ZP` from median noise in central 80%
+5. **Forced photometry** (`-f` flag) — For each target position without a blind detection within the error radius, performs aperture photometry at the exact WCS position. Targets with zero or negative flux are skipped (the epoch becomes a regular non-detection). For positive flux, applies the zeropoint to get a calibrated magnitude and appends to the source catalog with `flag=4`. If the error exceeds `max_forced_mag_err` (default 0.33 mag), the measurement is treated as an upper limit on the detection map.
+6. **Diagnostic outputs** — `*_photometry.txt` (source catalog) + `*_photcal.png` (calibration plot) + `*_detections.png`
 
-2. **Source filtering**
-   - Keep only central 90% of image (avoid edge effects)
-   - Reject crowded sources (min separation: 8 pixels)
-   - Match to 2MASS catalog (tolerance: 2 pixels in WCS space)
-   - Exclude variable stars (cross-matched with VSX)
-
-3. **Zeropoint calculation**
-   - For each matched star: `ZP_i = mag_catalog - mag_instrumental`
-   - **Weighted mean**: `ZP = Σ(ZP_i / σ_i²) / Σ(1 / σ_i²)` where `σ_i = √(e_cat² + e_inst²)`
-   - **Iterative worst-outlier rejection**: removes one star with the largest |residual| per iteration until target RMS is reached or minimum stars remain
-
-4. **Quality assessment**
-   - Minimum 3 stars required
-   - RMS quality: VERY GOOD (<0.1), GOOD (<0.175), MEDIUM (<0.25), POOR (<0.35), VERY POOR (≥0.35)
-   - Rejection quality: fraction of stars rejected
-
-5. **Limiting magnitude**
-   - Computed from the image noise map: `mag_lim = ZP_inst − 2.5·log10(3 × σ_pix × √(π r²)) + ZP`
-   - `σ_pix` = median per-pixel noise in the central 80% of the combined noise map (FITS noise ⊕ SEP bkg RMS)
-   - Independent of number of detected sources — depends only on image depth and calibration
-
-6. **Diagnostic outputs**
-   - Photometry catalog: `*_photometry.txt` (all detected sources + matches + calibrated magnitudes)
-     - Includes header with OBJECT name, DATE-OBS, EXPTIME, ZP, RMS, quality flags, MagLim
-     - Columns: ra dec x y mag_inst e_mag_inst mag_cat e_mag_cat mag_cal e_mag_cal flag
-   - Diagnostic plot: `*_photcal.png` (instrumental vs catalog + residuals panel)
-
-**Note**: Photometry is run independently on **both** the coadd and each individual aligned frame. This provides per-frame zeropoints useful for monitoring and quality control. All photometry results are stored in `.txt` text files (not FITS headers).
-
-**Photometry results** (stored in `*_photometry.txt` header comments):
-- `Zeropoint`: Photometric zeropoint [mag]
-- `RMS residuals`: Zeropoint uncertainty (RMS) [mag]
-- `RMS quality`: Quality classification
-- `ZP_check`: Cross-validated quality (added after standard star check)
-- `Calibration stars`: Number of stars used
-- `Stars rejected`: Count and fraction
-- `Rejection quality`: Classification
-- `MagLim`: 3σ limiting magnitude [mag]
-- `OBJECT`: Target name from FITS header
-- `Image type`: `COADD (N frames)` or `SINGLE` — identifies whether the image is a co-add (with frame count) or an individual aligned frame
-
-**Only JHK filters** are photometrically calibrated (configured via `calibrate_filters`). Filters without 2MASS data (Z, GRI, H2) are skipped.
+Photometry runs on both coadd and individual aligned frames. Only JHK filters are calibrated.
 
 ### 10. Standard Star Validation
 
-For PROCTYPE=1 (standard star observations):
-- Find all sources within configurable tolerance radius (default: 40″) of the standard's RA/DEC
-- Pick the brightest source (lowest calibrated magnitude)
-- Compare calibrated magnitude vs 2MASS catalog magnitude
-- Calculate offset: ΔZP = |mag_calibrated - mag_catalog|
-- Quality: VERY GOOD (<0.05), GOOD (<0.1), MEDIUM (<0.2), POOR (≥0.2)
-- Flag inconsistencies in log
+For PROCTYPE=1 observations: find brightest source within 40″ of standard position, compare calibrated magnitude vs 2MASS. Quality: VERY GOOD (<0.05 mag), GOOD (<0.1), MEDIUM (<0.2), POOR (≥0.2).
 
 ### 11. Zeropoint Consistency Check
 
-- For each non-standard (science) file, find closest standard star coadd in time (same filter)
-- Retrieve the standard's catalog-based ZP
-- Correct for exposure-time difference: `ZP_standard = ZP_std + 2.5 × log10(exptime_sci / exptime_std)`
-- Compare with science file's catalog-based ZP
-- Quality assessment using same thresholds as standard star validation
-- Updates `ZP_check` comment in photometry `.txt` files (not FITS headers)
+For each science file: compare its catalog-based ZP with the nearest standard star's ZP (corrected for exposure time difference). Results written to `ZP_check` in photometry files.
 
-### 12. Quality Flags Summary
+### 12. Quality Summary
 
-At the end of processing, the pipeline prints aggregate statistics:
-- **RMS quality distribution**: counts of VERY GOOD / GOOD / MEDIUM / POOR / VERY POOR
-- **Rejection quality distribution**: counts of GOOD / MEDIUM / POOR
-- **ZP_check quality distribution**: counts from standard star and consistency checks
+End-of-run aggregate statistics: RMS quality, rejection quality, and ZP_check distributions.
 
 ## Output Structure
 
 ```
 output/
-├── tmp/                                    # Temporary processing files
-│   ├── old/                                # Pre-2025 system (DWANGLE) - all products
-│   │   ├── file001.fits                    # Raw frames (DITHID=1-5, PSTATSUB=0)
-│   │   ├── OBJECT_OBSID_SUBID_FILTER_sky.fits  # Single sky per group (DITHID=98, PSTATSUB=1)
-│   │   ├── file001_skysub.fits             # Sky-subtracted (DITHID=1-5, PSTATSUB=2)
-│   │   ├── file001_skysub_aligned.fits     # Aligned (DITHID=1-5, PSTATSUB=3)
-│   │   ├── OBJECT_OBSID_SUBID_FILTER.fits  # Co-add (DITHID=99, PSTATSUB=4)
-│   │   └── ...
-│   └── new/                                # Post-2025 system (DITHANGL) - all products
-│       └── ...
-├── catalogs/                               # Downloaded reference catalogs
-│   ├── catalog_150.1234_-23.4567.csv       # 2MASS + VSX data
-│   └── ...
-├── reduced/                                # Final calibrated products
-│   ├── OBJECT_OBSID_SUBID_FILTER_astro.fits           # WCS-calibrated co-adds
-│   ├── *_skysub_aligned_astro.fits                     # WCS-calibrated aligned frames
-│   ├── OBJECT_OBSID_SUBID_FILTER_astro_photometry.txt  # Source catalogs
-│   ├── OBJECT_OBSID_SUBID_FILTER_astro_photcal.png     # Diagnostic plots
-│   ├── OBJECT_OBSID_SUBID_FILTER_sky.fits              # Sky pattern (DITHID=98)
-│   ├── FLAT_*.fits                         # Flat fields (pass-through)
-│   ├── FOCUS_*.fits                        # Focus frames (pass-through)
-│   ├── pipelog.txt                         # Complete processing log
-│   └── *.jpg                               # Preview images (if enabled)
+├── tmp/
+│   ├── old/                              # Pre-2025 system (DWANGLE)
+│   │   ├── file001.fits                  # Prepared raw frames
+│   │   ├── OBJECT_OBSID_SUBID_FILTER_sky.fits
+│   │   ├── file001_skysub.fits
+│   │   ├── file001_skysub_aligned.fits
+│   │   └── OBJECT_OBSID_SUBID_FILTER.fits  # Co-add
+│   └── new/                              # Post-2025 system (DITHANGL)
+├── catalogs/
+│   └── catalog_150.1234_-23.4567.csv     # 2MASS + VSX
+├── reduced/
+│   ├── OBJECT_OBSID_SUBID_FILTER_astro.fits            # WCS-calibrated co-add
+│   ├── *_skysub_aligned_astro.fits                      # WCS-calibrated aligned frames
+│   ├── *_astro_photometry.txt                           # Source catalog + calibration
+│   ├── *_astro_photcal.png                              # Calibration diagnostic plot
+│   ├── *_astro_detections.png                            # Detection map (with target overlay if -f)
+│   ├── OBJECT_OBSID_SUBID_FILTER_sky.fits               # Sky pattern
+│   ├── FLAT_*.fits                                      # Flat fields (pass-through)
+│   ├── FOCUS_*.fits                                     # Focus frames (pass-through)
+│   ├── pipelog.txt                                      # Processing log
+│   └── *.jpg                                            # Preview images (if enabled)
 ```
 
-**Note on failed astrometry**: Files that fail astrometric calibration are saved to `reduced/` with their original name (no `_astro` suffix), e.g., `OBJECT_OBSID_SUBID_FILTER.fits`.
+Files that fail astrometry are saved without the `_astro` suffix.
 
-### File Type Markers (FITS Keywords)
+### FITS Keywords
 
-| File Type | DITHID | PSTATSUB | Location |
-|-----------|--------|----------|----------|
-| Raw science | 1-5 | 0 | tmp/old/ or tmp/new/ |
-| Sky pattern | 98 | 1 | tmp/old/ or tmp/new/ |
-| Sky-subtracted | 1-5 | 2 | tmp/old/ or tmp/new/ |
-| Aligned | 1-5 | 3 | tmp/old/ or tmp/new/ |
-| Co-add | 99 | 4 | tmp/old/ or tmp/new/, reduced/ |
-| Flat field | varies | 1 | reduced/ |
-| Focus frame | varies | 1 | reduced/ |
+| Keyword | Values | Added |
+|---------|--------|-------|
+| `PROCTYPE` | 0=FLAT, 1=STD, 2=SCI, -1=FOCUS | File prep |
+| `PROCSTAT` | 0=raw, 1=reduced | File prep |
+| `PSTATSUB` | 1=sky, 2=skysub, 3=aligned, 4=coadd | Processing |
+| `DITHID` | 1-5=position, 98=sky, 99=coadd | Processing |
+| `INCOMP` | 0=complete, 1=incomplete dither | Co-add |
+| `ASTROP` | 0=not processed, 1=failed, 2=success | Astrometry |
 
-**Note**: All intermediate products (raw, sky, skysub, aligned, coadd) are stored together in `tmp/old/` or `tmp/new/` based on dither system. Sky patterns have DITHID=98 (generic sky marker). Each group produces one sky pattern shared by all N frames.
+Photometric results (ZP, RMS, MagLim) are in `*_photometry.txt` files, not FITS headers.
 
 ## Configuration
 
-All processing parameters in `config.yaml`. Key sections:
+All parameters in `config.yaml`. Key sections with actual default values:
 
 ### Paths & Calibration
 
 ```yaml
 paths:
-  data_folder: data_2026_01    # Calibration files directory
+  data_folder: data_2026_01
 
 calibration:
-  enable_pixel_mask: true      # Apply bad pixel mask
+  enable_pixel_mask: true
   mask_file: pixel_mask.fits
-  
-  enable_flat_correction: true # Flat fielding (applied after sky subtraction)
-  
-  enable_thermal_correction: true   # Thermal residual correction (fringing-style)
-  thermal_filters: [K]               # Filters for thermal correction
-  thermal_requirements:
-    min_files: 10              # Min skysub files per (filter, dither_angle) group
-    min_positions: 3           # Min unique RA/DEC pointings
-    min_separation_arcsec: 10.0  # Two pointings are "different" if ≥ this apart
+  enable_flat_correction: true
 ```
 
-### Detector Parameters
+### Detector
 
 ```yaml
 detector:
-  gain: 5.0                    # e-/ADU (REMIR nominal)
-  read_noise: 25               # e- (NICS RRR mode)
-  pixel_scale: 1.221           # arcsec/pixel
+  gain: 5.0           # e-/ADU
+  read_noise: 25       # e-
+  pixel_scale: 1.221   # arcsec/pixel
 ```
 
 ### Sky Subtraction
 
 ```yaml
 sky_subtraction:
-  central_fraction: 0.8        # Region for median calculation
-  sigma_clip: 3.0              # Outlier rejection threshold
-  noise_median_factor: 1.253   # Noise scaling for median
+  central_fraction: 0.8
+  sigma_clip: 3.0
+  noise_median_factor: 1.253
+
+  source_masking:           # Post-median residual cleanup
+    enabled: true
+    threshold_sigma: 2.0
+    min_area: 3
+    bw: 64
+    bh: 64
+
+  loo_iterative_gauss:      # Thermal arc removal (K-band)
+    enabled: true
+    n_iter: 3
+    base_sigma: 25.0
+    sigma_decay: 0.8
+    source_sigma: 1.8
+    source_grow_base: 10.0
+    filter_enable:
+      K: true
+      J: false
+      H: false
 
 grouping:
-  max_time_gap_hours: 9.0      # Max gap between frames in same group [hours]
+  max_time_gap_hours: 9.0
 ```
 
 ### Alignment
 
 ```yaml
 alignment:
-  base_angle: 72               # Base rotation offset [degrees]
-  drizzle_pixfrac: 0.8         # Pixel fraction (0.8 = sharper PSF, 1.0 = full pixel)
-  
+  base_angle: 72
+  drizzle_pixfrac: 0.8
+
   refinement:
-    enabled: true              # Enable similarity-transform refinement
-    min_pixels: 5              # Detection threshold
+    enabled: true
+    fit_mode: 'similarity'
+    min_pixels: 5
     threshold_sigma: 2.0
-    pix_tol: 2.0               # Pixel tolerance for matching [pixels]
-    max_sources: 50            # Cap to N brightest
-    min_matches: 4             # Min matched sources
-    min_match_fraction: 0.15   # Min fraction matched (15%)
-    accept_rms_px: 1.5         # Max RMS [pixels]
-    n_refine_iters: 2          # Re-match iterations
-    sigma_clip_iters: 3        # Sigma-clipping rounds
-    sigma_clip_threshold: 3.0  # Rejection threshold [sigma]
-    fallback_to_blind: true    # Use blind geometry when refinement fails
-  
-  old:  # Pre-2025 system parameters
-    dithangl_key: DWANGLE
-    theta_offset: -72
-    theta_n: 5
-    r_n: 17
-  
-  new:  # Post-2025 system parameters
-    dithangl_key: DITHANGL
-    theta_offset: 0
-    theta_n: 5
-    r_n: 17
+    max_sources: 50
+    pix_tol: 2.0
+    min_matches: 4
+    min_match_fraction: 0.15
+    accept_rms_px: 1.5
+    n_refine_iters: 2
+    sigma_clip_iters: 3
+    sigma_clip_threshold: 3.0
+    fallback_to_blind: true
 ```
 
-### Detection & Astrometry
+### Detection
 
 ```yaml
 detection:
-  min_pixels: [10, 5]          # Try in order
-  threshold_sigma: [2.0, 1.2]  # Try in order
-  aperture_radius: 3.5         # Photometry aperture [pixels]
-  margin_frac: 0.02            # Buffer zone outside image for catalog matching
-  instrumental_zeropoint: 0.0  # Arbitrary ZP for source sorting
-  sep_bw: 128                  # SEP background mesh width
-  sep_bh: 128                  # SEP background mesh height
-  sep_fw: 2                    # Background filter width
-  sep_fh: 2                    # Background filter height
-  n_iter: 3                    # Background iterations for crowded fields
-  iter_mask_scale: 2.5         # Mask scale between iterations
+  min_pixels: [10, 5]
+  threshold_sigma: [2.0, 1.2]
+  aperture_radius: 3.5
+  margin_frac: 0.02
+  instrumental_zeropoint: 0.0
+  sep_bw: 64
+  sep_bh: 64
+  sep_fw: 2
+  sep_fh: 2
+  deblend_nthresh: 64
+  deblend_cont: 0.005
+  n_iter: 3
+  iter_mask_scale: 2.5
+```
 
+### Astrometry
+
+```yaml
 astrometry:
-  min_sources: 3               # Min sources to attempt
-  n_sources_detected: 25       # N brightest for quads
+  min_sources: 3
+  n_sources_detected: 25
   n_sources_catalog: 25
-  num_quads: 2500              # Max quads to generate
-  threshold_code: 0.05         # Geometric matching threshold
-  pix_tol: 2.0                # Pixel tolerance for matching
-  
-  min_match_fraction: 0.12     # Min fraction matched
-  accept_rms_px: 1.5           # Max RMS [pixels]
-  min_matches_rank: 3          # Min matches for valid transform
-  
-  top_matches: 0               # Quad matches to evaluate (0 = all)
-  print_best_only: true        # Compact output mode
-  
-  consensus:                   # Transform clustering
+  num_quads: 2500
+  threshold_code: 0.05
+  pix_tol: 2.0
+  min_matches_rank: 3
+  min_match_fraction: 0.12
+  accept_rms_px: 1.5
+  top_matches: 0
+  print_best_only: true
+  scale_min: 0.95
+  scale_max: 1.05
+  wcs_projection: 'TAN'
+  sip_degree: 2
+  try_reflection: false
+  skip_filters: ["GRISM", "H2"]
+
+  consensus:
     scale_bin: 0.02
     angle_bin: 0.5
     translation_bin: 5
     merge_translation_px: 5.0
     merge_angle_deg: 1.0
     merge_scale: 0.02
-    rank_rms_weight: 1.0       # score = n_matches - weight × RMS
-  
-  scale_min: 0.95              # Scale constraint (with -s flag)
-  scale_max: 1.05
-  
-  wcs_projection: 'TAN'       # WCS projection type
-  sip_degree: 2                # SIP distortion polynomial degree
-  
+    rank_rms_weight: 1.0
+
   catalog:
-    grouping_tolerance_arcmin: 1.0  # Images sharing same catalog
-    radius_arcmin: 10.0        # Cone search radius
-    download_timeout: 30       # HTTP timeout [sec]
-    download_retries: 3        # Retry attempts
-    download_limit: 10000      # Max sources per query
-    vsx_match_arcsec: 0.5      # VSX cross-match tolerance
-    default_mag: 99.0          # Placeholder for missing magnitudes
-    default_error: 0.4         # Default magnitude error
-  
-  filter_fallback:             # Try filters in order
+    grouping_tolerance_arcmin: 1.0
+    radius_arcmin: 10.0
+    download_timeout: 30
+    download_retries: 3
+    download_limit: 10000
+    vsx_match_arcsec: 0.5
+    default_mag: 99.0
+    default_error: 0.4
+
+  filter_fallback:
     J: ["J", "H"]
     K: ["K", "H"]
     H: ["H"]
     H2: ["H"]
     Z: ["H"]
     GRI: ["H"]
-  
-  skip_filters: ["GRISM", "H2"]  # Filters to skip astrometry entirely
-  try_reflection: false          # Try mirror-flipped geometry if normal fails
 ```
 
 ### Photometry
@@ -558,20 +425,24 @@ astrometry:
 ```yaml
 photometry:
   enabled: true
-  threshold_sigma: 1.2         # Fixed detection threshold [sigma]
-  min_pixels: 5                # Fixed minimum pixels
-  aperture_radius: 3.0         # Fixed aperture [pixels]
-  central_fraction: 0.90       # Central region only
-  min_isolation_dist: 8.0      # Min separation [pixels]
-  match_tolerance: 2.0         # Max match distance [pixels]
-  sigma_clip: 3.0              # Outlier rejection
-  max_iterations: 10           # Max clipping iterations
-  min_calibration_stars: 3     # Min stars required
-  max_inst_mag_err: 0.2        # Max instrumental mag error
-  target_rms: 0.2              # Target RMS for clipping [mag]
-  calibrate_filters: ['J', 'H', 'K']  # Only these have 2MASS calibration
-  standard_check_tolerance_arcsec: 40.0  # Standard star matching radius [arcsec]
-  
+  threshold_sigma: 1.2
+  min_pixels: 5
+  aperture_radius: 3
+  central_fraction: 0.90
+  min_isolation_dist: 6.0
+  match_tolerance: 2.0
+  min_calibration_stars: 3
+  max_inst_mag_err: 0.3
+  target_rms: 0.15
+  max_forced_mag_err: 0.33    # Max error for forced photometry to count as detection
+  calibrate_filters: ['J', 'H', 'K']
+  standard_check_tolerance_arcsec: 40.0
+
+  star_selection:
+    max_ellipticity: 0.4
+    size_sigma: 3.0
+    max_flag: 0
+
   quality_thresholds:
     rms:
       very_good: 0.1
@@ -581,159 +452,109 @@ photometry:
     rejection:
       good: 0.25
       medium: 0.50
+      poor: 0.70
     zp_comparison:
       very_good: 0.05
       good: 0.1
       medium: 0.2
+      poor: 0.3
 ```
 
-### Preview
+### Co-addition
 
 ```yaml
-preview:
-  enabled: false               # Generate JPG previews
-  colormap: 'Greys'
-  invert: true                 # Black stars on white background
-  dpi: 100
-  figsize: [8, 8]
-  title_fontsize: 14
-  use_central_stats: true
-  central_fraction: 0.8
-  vmin_sigma: -0.5
-  vmax_sigma: 4.0
+coadd:
+  sigma_clip: 4.0
+  sigma_clip_iters: 2
 ```
 
-**See `config.yaml` for complete parameter documentation with inline comments.**
+### Detection Map & Preview
 
-## FITS Header Keywords
+```yaml
+detection_map:
+  enabled: false
+  colormap: 'Greys'
+  dpi: 200
+  figsize: [8, 8]
 
-### Standard Keywords (Input)
+preview:
+  enabled: false
+  colormap: 'Greys'
+  invert: true
+  dpi: 100
+```
 
-| Keyword | Description | Values |
-|---------|-------------|--------|
-| `OBJECT` | Target name | String |
-| `FILTER` | Filter name | J, H, K, H2, etc. |
-| `EXPTIME` | Exposure time | Seconds |
-| `OBSTYPE` | Observation type | FLATF, STDSTAR, etc. |
-| `IMAGETYP` | Image type | OBJECT, FOCUS |
-| `OBSID` | Observation ID | Integer |
-| `SUBID` | Sub-observation ID | Integer |
-| `NDITHERS` | Expected dither positions | Integer (typically 5) |
-| `DITHANGL` | Dither angle (new system) | Degrees (0-360) |
-| `DWANGLE` | Dither wedge angle (old system) | Degrees |
-| `DATE-OBS` | Observation timestamp | ISO format |
-
-### Pipeline-Added Keywords (FITS headers)
-
-| Keyword | Description | Values | Added When |
-|---------|-------------|--------|------------|
-| `PROCTYPE` | Processing type | 0=FLAT, 1=STD, 2=SCI, -1=FOCUS | File prep |
-| `PROCSTAT` | Processing status | 0=raw, 1=reduced | File prep / processing |
-| `PSTATSUB` | Processing sub-status | 1=sky, 2=skysub, 3=aligned, 4=coadd | Processing |
-| `DITHID` | Dither ID | 1-5=position, 98=sky, 99=coadd | Processing |
-| `FILENAME` | File name | String | File prep |
-| `INCOMP` | Incomplete dither flag | 0=complete, 1=incomplete | Co-add |
-| `THMALPHA` | Thermal correction scaling | Float (EXPTIME / 10) | Thermal |
-| `ASTROP` | Astrometry status | 0=not processed, 1=failed/skipped, 2=success | Astrometry |
-
-**Note**: Photometric calibration results (ZP, RMS, MagLim, etc.) are stored in the `*_photometry.txt` text files, **not** in FITS headers.
-
-### WCS Keywords (Updated by Astrometry)
-
-Standard WCS + SIP distortion keywords added by astropy WCS fitting.
+See `config.yaml` for the complete parameter reference with inline comments.
 
 ## Quality Metrics
 
-### Photometric RMS Quality
+### Photometric RMS
 
-| Classification | RMS Threshold | Interpretation |
-|----------------|---------------|----------------|
-| **VERY GOOD** | < 0.10 mag | Excellent calibration |
-| **GOOD** | < 0.175 mag | Good calibration |
-| **MEDIUM** | < 0.25 mag | Acceptable |
-| **POOR** | < 0.35 mag | Marginal |
-| **VERY POOR** | ≥ 0.35 mag | Questionable |
+| Classification | RMS [mag] |
+|----------------|-----------|
+| VERY GOOD | < 0.10 |
+| GOOD | < 0.175 |
+| MEDIUM | < 0.25 |
+| POOR | < 0.35 |
+| VERY POOR | ≥ 0.35 |
 
-### Rejection Quality
+### Rejection Fraction
 
-| Classification | Rejection Fraction | Interpretation |
-|----------------|-------------------|----------------|
-| **GOOD** | < 25% | Clean star field |
-| **MEDIUM** | 25-50% | Some contamination |
-| **POOR** | ≥ 50% | Crowded/problematic |
+| Classification | Fraction |
+|----------------|----------|
+| GOOD | < 25% |
+| MEDIUM | 25–50% |
+| POOR | 50–70% |
+| VERY POOR | ≥ 70% |
 
-### Standard Star Zeropoint Comparison
+### ZP Comparison (Standard Stars)
 
-| Classification | Delta ZP Threshold | Interpretation |
-|----------------|---------------|----------------|
-| **VERY GOOD** | < 0.05 mag | Excellent agreement |
-| **GOOD** | < 0.10 mag | Good agreement |
-| **MEDIUM** | < 0.20 mag | Acceptable |
-| **POOR** | ≥ 0.20 mag | Check calibration |
+| Classification | |ΔZP| [mag] |
+|----------------|-------------|
+| VERY GOOD | < 0.05 |
+| GOOD | < 0.10 |
+| MEDIUM | < 0.20 |
+| POOR | < 0.30 |
+| VERY POOR | ≥ 0.30 |
 
 ## Troubleshooting
 
-### Common Issues
+### No sources detected
 
-#### No sources detected
-**Symptoms**: Astrometry fails with "Not enough sources detected"
+- Lower `detection.threshold_sigma` (try [1.5, 1.0])
+- Reduce `detection.min_pixels` (try [5, 3])
+- Check sky subtraction quality (`*_skysub.fits`)
 
-**Solutions**:
-- Lower `threshold_sigma` in config (try 1.0-1.2)
-- Reduce `min_pixels` (try 3-5)
-- Check sky subtraction quality (look at `*_skysub.fits`)
-- Verify image is not saturated or very faint
+### Astrometry fails
 
-#### Astrometry fails repeatedly
-**Symptoms**: All quad-matching attempts fail
+- Remove `-s` flag (scale constraint)
+- Increase `astrometry.catalog.radius_arcmin` (try 15–20)
+- Enable `try_reflection: true`
+- Check catalog download in `catalogs/`
 
-**Solutions**:
-- Disable scale constraint (remove `-s` flag)
-- Check initial WCS in header (RA, DEC, CRPIX, CDELT)
-- Increase `catalog_radius_arcmin` (try 15-20)
-- Enable reflection: `try_reflection: true` in config
-- Verify catalog download successful (check `catalogs/`)
-- Try different `filter_fallback` (use H-band for all)
+### Photometry fails
 
-#### Photometry calibration fails
-**Symptoms**: "Photometry failed" or too few calibration stars
+- Check filter is in `calibrate_filters` (J, H, K only)
+- Verify ASTROP=2 in FITS header
+- Increase `photometry.match_tolerance` for poor WCS
 
-**Solutions**:
-- Check filter in `calibrate_filters` list (J, H, K only)
-- Verify astrometry succeeded (ASTROP=2 in FITS header)
-- Lower `min_calibration_stars` (try 2-3 for sparse fields)
-- Increase `match_tolerance` (try 3.0-5.0 for poor WCS)
-- Check 2MASS catalog has sufficient stars at this position
+### Flat not found
 
-#### Flat field not found
-**Symptoms**: "No flat found for filter X"
+- Filename format: `{FILTER}_dither{ANGLE}_flat.fits`
+- Angles: 0, 72, 144, 216, 288
+- Check `paths.data_folder` in config
 
-**Solutions**:
-- Check filename format: `{FILTER}_dither{ANGLE}_flat.fits`
-- Verify filter name is uppercase: J, H, K (not j, h, k)
-- Confirm `data_folder` path in config is correct
-- Dither angles must be rounded to: 0, 72, 144, 216, 288
-- Create missing flats (see `cal_flat_and_bad_pix.ipynb`)
+### Thermal arc residual (K band)
 
-#### Thermal correction not applied
-**Symptoms**: No thermal correction messages in log
-
-**Solutions**:
-- Check `enable_thermal_correction: true` in config
-- Verify filter in `thermal_filters` list (e.g., `[K]`)
-- Ensure sufficient skysub files for (filter, dither_angle) group (need ≥10, configurable via `thermal_requirements.min_files`)
-- Ensure files span ≥3 distinct sky pointings separated by ≥10″ (configurable via `thermal_requirements.min_positions` / `min_separation_arcsec`)
-- Check dither angles are correctly rounded to 0, 72, 144, 216, 288
-
-#### Co-add has artifacts
-**Symptoms**: Residual cosmic rays or streaks in co-add
-
-**Solutions**:
-- No sigma-clipping is currently implemented in co-addition
-- Check individual skysub frames for cosmic rays or bad pixels
-- Verify alignment quality (check residuals in aligned frames)
-- Improve bad pixel mask coverage
-- Check for bad individual frames in `tmp/old/` or `tmp/new/`
+Enable LOO + Iterative Gaussian mode:
+```yaml
+sky_subtraction:
+  loo_iterative_gauss:
+    enabled: true
+    filter_enable:
+      K: true
+```
+This uses leave-one-out sky subtraction (breaking the arc correlation) followed by iterative Gaussian background removal to clean up residuals. See the Configuration section for tuneable parameters.
 
 ### Debug Workflow
 
@@ -790,7 +611,8 @@ Typical processing times (approximate, single-core):
 | Step | Time per... | Notes |
 |------|-------------|-------|
 | File preparation | ~0.5-1 sec/file | Gunzip + header fixes |
-| Sky subtraction | ~3-5 sec/group | N=5 dithers |
+| Sky subtraction | ~3-5 sec/group | N=5 dithers (standard mode) |
+| Sky subtraction (LOO+IG) | ~15-25 sec/group | LOO + 3 IterGauss iterations per frame |
 | Alignment | ~2-3 sec/coadd | Drizzling algorithm |
 | Co-addition | ~1-2 sec/coadd | Inverse-variance weighted |
 | Astrometry | ~2-10 sec/coadd | Varies with attempts |
@@ -858,7 +680,8 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 
 **Dependencies:**
 - [Astropy](https://www.astropy.org/) - Astronomy fundamentals
-- [Photutils](https://photutils.readthedocs.io/) - Photometry toolkit (includes SEP)
+- [Photutils](https://photutils.readthedocs.io/) - Aperture photometry
+- [SEP](https://sep.readthedocs.io/) - Source Extraction and Photometry
 - [NumPy](https://numpy.org/) - Numerical computing
 - [SciPy](https://scipy.org/) - Scientific computing
 - [Matplotlib](https://matplotlib.org/) - Plotting
@@ -880,13 +703,30 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 
 ## Version History
 
+**v2.2** (2026-03)
+- **Shift-only alignment refinement** (`fit_mode: 'shift'`)
+  - Sigma-clipped median of matched coordinate differences (2 parameters: dx, dy)
+  - Default remains `fit_mode: 'similarity'` (full similarity transform, 4 parameters)
+  - Use `'shift'` when inter-frame rotation is negligible (e.g., REMIR dithers <0.02°)
+- **Alignment rescue mechanism**: when initial cross-match fails (<15% matches), automatically retries with progressively wider tolerance (2×, 4×, 8×), recovering frames that previously fell back to inaccurate blind shifts
+
+**v2.1** (2026-03)
+- **LOO + Iterative Gaussian sky subtraction mode** (`loo_iterative_gauss.enabled: true`)
+  - Leave-one-out sky (median of N−1 other frames) breaks wedge-prism arc correlation
+  - 3-iteration coarse-to-fine Gaussian background subtraction removes residual arc pattern
+  - Full noise propagation through LOO sky, flat division, and IterGauss background subtraction
+  - Fully configurable: iteration count, sigma schedule, source masking parameters
+  - Standard N-frame sky still saved as product for output consistency
+  - Activated via single config toggle; all parameters tuneable in `config.yaml`
+  - **Normalized convolution** for source-masked background estimation (replaces global median fill), eliminating negative halos around bright sources
+  - **Fixed source mask** built once before the iteration loop (replaces per-iteration re-detection), eliminating negative "holes" in the coadd caused by mask inconsistencies
+
 **v2.0** (2026-02)
 - Median sky subtraction from all N frames (simpler, more robust)
-- **Single-pass affine drizzle** for alignment: full rotation + scale + translation
+- **Single-pass affine drizzle** for alignment: translation or full rotation + scale + translation
   in one drizzle step, no double interpolation (same principle as AQuA/PREPROCESS)
-- Thermal correction with EXPTIME-based linear scaling and diversity gate
-- Processing order: level → sky → flat → thermal
-- Optional alignment refinement via cross-matching + similarity transform
+- Processing order: level → sky → flat
+- Optional alignment refinement via cross-matching (shift-only or similarity transform)
 - Fixed noise model (read noise in correct ADU² units)
 - Enhanced FITS keyword tracking
 - Comprehensive documentation
