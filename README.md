@@ -687,6 +687,12 @@ A companion notebook (`batch_analyses_and_lightcurve.ipynb`) can then collect al
 
 ## Version History
 
+**v2.3** (2026-04)
+- **Light curve notebook** (`batch_analyses_and_lightcurve.ipynb`)
+  - Unified detection/upper-limit logic: any source (blind or forced) with `e_mag_cal > MAX_MAG_ERROR` is demoted to upper limit, not just forced photometry
+  - Separated `mag_cal` and `Limiting_mag` columns — measured magnitude and header limiting magnitude are never mixed; plot uses `mag_cal` for detections and `Limiting_mag` for upper limits
+  - Configurable `MAX_MAG_ERROR` threshold (default 0.4 mag) independent of the pipeline's `max_forced_mag_err`
+
 **v2.2** (2026-03)
 - **Shift-only alignment refinement** (`fit_mode: 'shift'`)
   - Sigma-clipped median of matched coordinate differences (2 parameters: dx, dy)
