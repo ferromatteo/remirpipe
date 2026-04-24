@@ -10,6 +10,9 @@ catalogs/
 *.jpg
 *.png
 data_*/
+!data/
+!data/data_2026_04/
+!data/data_2026_04/*.fits
 .DS_Store
 
 # Test data directories
