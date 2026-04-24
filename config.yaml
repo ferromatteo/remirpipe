@@ -5,10 +5,9 @@
 # PATHS
 # ============================================================================
 paths:
-  data_folder: data_2026_01    # Folder containing all calibration files (relative to script)
+  data_folder: data/data_2026_04    # Folder containing all calibration files (relative to script)
                                # Contains: pixel_mask.fits, 
-                               #           {FILTER}_dither{ANGLE}_flat.fits,
-                               #           {FILTER}_dither{ANGLE}_exptime{SEC}_thermal.fits (optional)
+                               #           {FILTER}_dither{ANGLE}_flat.fits
 
 # ============================================================================
 # FITS HEADER MARKERS
@@ -17,10 +16,6 @@ fits_markers:
   dithid_sky: 98               # DITHID value for sky frames
   dithid_coadd: 99             # DITHID value for coadded frames
   dithid_exclude: [98, 99]     # DITHID values to delete during preparation
-  proctype_flat: 0             # PROCTYPE for flat fields
-  proctype_std: 1              # PROCTYPE for standard stars
-  proctype_sci: 2              # PROCTYPE for science frames
-  proctype_focus: -1           # PROCTYPE for focus frames
   procstat_reduced: 1          # PROCSTAT for reduced frames
   pstatsub_sky: 1              # PSTATSUB for sky frames
   pstatsub_skysub: 2           # PSTATSUB for sky-subtracted frames
@@ -35,6 +30,7 @@ detector:
   read_noise: 25               # Read noise [e-] - detector readout noise (100 NOMINAL FROM HEADER, NICS has 25 for the RRR mode)
   pixel_scale: 1.221           # Pixel scale [arcsec/pixel] - plate scale of REMIR
 
+
 # ============================================================================
 # CALIBRATION CORRECTIONS (each can be enabled/disabled independently)
 # ============================================================================
@@ -45,20 +41,6 @@ calibration:
   
   # 2) Flat field correction - applied after sky subtraction
   enable_flat_correction: true # Apply flat field correction (data / flat)
-  
-  # 3) Thermal residual correction - post-processing after sky subtraction
-  # Scales all skysub files to 10s reference, takes median → thermal template
-  # Applies template scaled by EXPTIME/10 (linear thermal assumption)
-  enable_thermal_correction: true    # Apply thermal residual correction
-  thermal_filters: [K]      # Filters for thermal residual correction
-  
-  # Thermal correction diversity requirements
-  # The template is reliable only when built from many files spanning
-  # several distinct sky pointings (so real sources wash out in the median).
-  thermal_requirements:
-    min_files: 10              # Minimum number of skysub files per (filter, dither_angle) group
-    min_positions: 3           # Minimum number of unique RA/DEC pointings
-    min_separation_arcsec: 10.0  # Two pointings are "different" only if separated by ≥ this [arcsec]
 
 # ============================================================================
 # GROUPING PARAMETERS (for sky subtraction)
@@ -73,6 +55,51 @@ sky_subtraction:
   central_fraction: 0.8        # Central region for median calculation (0.8 = inner 80%)
   sigma_clip: 3.0              # Sigma clipping threshold for outlier rejection
   noise_median_factor: 1.253   # Noise scaling for median combination (1.253 for Gaussian)
+  
+  # Source masking before sky construction.
+  # Detects and masks sources in each frame BEFORE computing the median sky.
+  # Critical for crowded fields where unmasked stars contaminate the sky frame.
+  source_masking:
+    enabled: true              # Enable source masking before median sky
+    threshold_sigma: 2.5       # Detection threshold [sigma above local background]
+    min_area: 5                # Minimum connected pixels for a source
+    grow_radius: 3.5           # SEP ellipse growth factor (base, for faint sources)
+    grow_radius_max: 10.0      # Cap on grow radius after brightness scaling
+    bright_grow_scale: 0.4     # Extra grow per decade of flux above bright_flux_ref
+                               # r_eff = grow_radius * (1 + scale * log10(flux/ref))
+                               # e.g. scale=0.4: star 100x brighter than ref -> r*1.8
+    bright_flux_ref: 500.0     # Reference flux [ADU·px] — no extra growth below this
+    bw: 64                     # Background mesh width [pixels]
+    bh: 64                     # Background mesh height [pixels]
+
+  # Detector-domain artifact masking (after sky subtraction + flat field, before alignment).
+  # Targets isolated fixed-pixel spikes/hot-dead pixels that project as pentagonal
+  # artifacts after dither alignment and coaddition.
+  detector_artifact_mask:
+    enabled: false
+    spike_sigma: 8.0           # Threshold on |data - local_median_3x3| in units of local noise
+    max_cluster_pixels: 1      # Keep only isolated/small clusters (protects real stellar cores)
+    include_negative: true     # Also mask deep negative spikes
+    min_abs_adu: 0.0           # Optional absolute threshold on |data-local_median| [ADU]
+
+  # LOO + Iterative Gaussian sky subtraction (thermal wedge-prism arc removal)
+  # When enabled: sky for each frame = median of the OTHER N-1 frames (leave-one-out),
+  # then iterative Gaussian background subtraction removes residual arc pattern.
+  # The standard N-frame median sky is still saved as a product.
+  loo_iterative_gauss:
+    enabled: true             # Set true to activate LOO + IterGauss mode
+    n_iter: 3                  # Number of Gaussian subtraction iterations
+    base_sigma: 25.0           # Starting Gaussian σ [pixels] (decays each iteration)
+    sigma_decay: 0.8           # Decay factor: σ_i = base_sigma × decay^i
+    source_sigma: 1.8          # Source detection threshold [σ above background]
+    source_grow_base: 10.0     # Source mask ellipse growth factor [pixels]
+    # Per-filter enable/disable (overrides global 'enabled' for specific filters).
+    # Filters not listed here follow the global 'enabled' flag.
+    # The thermal wedge-prism arc is mainly a K-band issue; J and H rarely need this.
+    filter_enable:
+      K: true
+      J: false
+      H: false
 
 # ============================================================================
 # ALIGNMENT PARAMETERS (dithering geometry)
@@ -97,11 +124,16 @@ alignment:
   
   drizzle_pixfrac: 0.8          # Drizzle pixel fraction (1.0=full pixel, <1.0=shrink for sharper PSF)
                                # 0.8 gives ~10% sharper PSF with minimal noise penalty
+  drizzle_min_weight_frac: 0.15 # Mask output pixels with very low drizzle coverage
+                                # (reduces border stripes from partial-overlap edge pixels)
   
   # Optional alignment refinement (uses source detection & cross-matching)
   refinement:
     enabled: true              # Enable alignment refinement via cross-matching
                                # If false or if refinement fails, falls back to blind dither geometry
+    fit_mode: 'similarity'     # 'shift' = sigma-clipped median shift (2-param)
+                               # 'similarity' = full similarity transform (4-param: rotation+scale+translation)
+                               # Similarity accounts for small inter-frame rotations (~0.02-0.07 deg)
     
     # Source detection for alignment
     min_pixels: 5              # Minimum connected pixels above threshold
@@ -138,11 +170,15 @@ detection:
                                # Used for sorting sources by brightness (value doesn't affect results)
   
   # SEP (Source Extractor Python) background estimation
-  sep_bw: 128                  # Background mesh box width [pixels]
-  sep_bh: 128                  # Background mesh box height [pixels]
+  sep_bw: 64                   # Background mesh box width [pixels]
+  sep_bh: 64                   # Background mesh box height [pixels]
   sep_fw: 2                    # Background filter width (smoothing)
   sep_fh: 2                    # Background filter height (smoothing)
   
+  # Source deblending
+  deblend_nthresh: 64          # Number of deblending sub-thresholds (default SEP: 32)
+  deblend_cont: 0.005          # Minimum contrast ratio for deblending (default SEP: 0.005)
+
   # Iterative detection for crowded fields
   n_iter: 3                    # Number of background iterations (1=single pass, 2+=iterative)
   iter_mask_scale: 2.5         # Mask sources at this × ellipse size between iterations
@@ -227,7 +263,10 @@ coadd:
   # coadd = Σ(data_i / σ_i²) / Σ(1 / σ_i²)
   # noise = √(1 / Σ(1 / σ_i²))
   # Pixel values at single-frame level; EXPTIME = total sum
-  # No configurable parameters
+  sigma_clip: 4.0              # Clip pixels > this many σ from weighted mean (symmetric: both positive and negative)
+  sigma_clip_iters: 2          # Max iterations of sigma-clipping (needs >= 3 frames)
+  robust_mad_clip: true       # Extra robust clipping around per-pixel median (better cosmic/hot rejection)
+  robust_mad_sigma: 5.0        # Threshold in MAD-equivalent σ for robust clipping
 
 # ============================================================================
 # PHOTOMETRIC CALIBRATION PARAMETERS
@@ -239,23 +278,30 @@ photometry:
   threshold_sigma: 1.2         # Detection threshold [sigma]
   min_pixels: 5                # Minimum connected pixels
   
-  # Aperture photometry - fixed radius
-  aperture_radius: 3.0         # Fixed aperture radius [pixels]
+  # Fixed aperture photometry
+  aperture_radius: 3          # Aperture radius [pixels] — single fixed value, no multi-aperture scan
   
   # Source filtering for calibration stars
   central_fraction: 0.90       # Only use sources in central 90% of image
-  min_isolation_dist: 8.0      # Min separation between sources [pixels]
+  min_isolation_dist: 6.0      # Min separation between sources [pixels]
                                # (rejects blended/crowded stars; should be > 2× max aperture)
+  
+  # Morphological star selection (image-based, applied to detections)
+  # Keeps only point-source-like objects whose size and shape match the PSF.
+  star_selection:
+    max_ellipticity: 0.4       # Max ellipticity (1 - b/a); rejects elongated objects
+    size_sigma: 3.0            # Size outlier threshold [sigma from stellar locus]
+    max_flag: 0                # Max SEP extraction flag (0 = clean, no blending/truncation)
   
   # Catalog matching
   match_tolerance: 2.0         # Max distance to match detection to catalog [pixels]
   
   # Zeropoint fitting with outlier rejection
-  sigma_clip: 3.0              # Sigma clipping for outlier rejection
-  max_iterations: 10           # Max iterations for iterative clipping
   min_calibration_stars: 3     # Min stars required for valid calibration
-  max_inst_mag_err: 0.2        # Max instrumental mag error (rejects faint/noisy)
-  target_rms: 0.2              # Target RMS - stop clipping when reached [mag]
+  max_inst_mag_err: 0.3        # Max instrumental mag error (rejects faint/noisy)
+  target_rms: 0.15              # Target RMS - stop clipping when reached [mag]
+  max_forced_mag_err: 0.33      # Max error for forced photometry detection [mag]
+                                # Forced measurements with larger errors are upper limits
   
   # Filters with 2MASS calibration available
   calibrate_filters: ['J', 'H', 'K']  # Skip Z, GRI, H2 (no 2MASS data)
@@ -275,13 +321,31 @@ photometry:
     # Fraction of rejected calibration stars
     rejection:
       good: 0.25               # < 25% rejected
-      medium: 0.50             # < 50% rejected (>= medium = POOR)
+      medium: 0.50             # < 50% rejected
+      poor: 0.70               # < 70% rejected (>= poor = VERY POOR)
     
     # Zeropoint comparison (standard vs field stars) [mag]
     zp_comparison:
       very_good: 0.05          # |diff| < 0.05 mag
       good: 0.1                # |diff| < 0.1 mag
-      medium: 0.2              # |diff| < 0.2 mag (>= medium = POOR)
+      medium: 0.2              # |diff| < 0.2 mag
+      poor: 0.3                # |diff| < 0.3 mag (>= poor = VERY POOR)
+
+# ============================================================================
+# DETECTION MAP (PNG with all detected sources circled)
+# ============================================================================
+detection_map:
+  enabled: false               # Generate detection map PNG
+  colormap: 'Greys'            # Matplotlib colormap
+  dpi: 200                     # Output resolution [dots per inch]
+  figsize: [8, 8]              # Figure size [width, height] in inches
+  central_fraction: 0.8        # Central region for percentile calculation
+  percentile_low: 5            # Lower percentile for image scaling
+  percentile_high: 95          # Upper percentile for image scaling
+  circle_color: 'red'          # Source circle edge color
+  circle_linewidth: 0.6        # Circle line width
+  circle_alpha: 0.8            # Circle transparency (0-1)
+  title_fontsize: 10           # Title font size
 
 # ============================================================================
 # PREVIEW GENERATION (optional JPG output)

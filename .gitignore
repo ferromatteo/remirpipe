@@ -11,3 +11,9 @@ catalogs/
 *.png
 data_*/
 .DS_Store
+
+# Test data directories
+test_sky_NIR/
+
+# Personal notebook copies
+notebooks/*_mine.ipynb

@@ -37,7 +37,9 @@ from astropy.time import Time
 from astropy.wcs import WCS
 from astropy.wcs.utils import fit_wcs_from_points
 from photutils.aperture import CircularAperture, aperture_photometry
+from scipy.ndimage import gaussian_filter, uniform_filter, median_filter
 from scipy.spatial import cKDTree
+import numpy.lib.recfunctions as rfn
 from scipy.spatial.distance import cdist
 
 # Global statistics to collect pipeline-wide counts
@@ -86,8 +88,57 @@ def parse_arguments():
                         help='Apply scale constraints (0.95-1.05) for astrometry')
     parser.add_argument('-co', '--clean-output', action='store_true',
                         help='Clean existing output directories before starting')
+    parser.add_argument('-t', '--target', nargs='+', default=None,
+                        help='Target OBJECT name(s) for astrometry/photometry only (e.g. -t NGC1234 M31). '
+                             'All data are processed but astrometry and photometry are performed only on matching OBJECTs.')
+    parser.add_argument('-f', '--target-file', default=None,
+                        help='Text file with target positions (RA DEC radius_arcsec per line). '
+                             'Supports sexagesimal (HH:MM:SS.ss DD:MM:SS.ss) or decimal degrees.')
     
     return parser.parse_args()
+
+
+def parse_target_file(filepath):
+    """Parse a target position file.
+    
+    Each line: RA DEC [radius_arcsec]
+    Supported formats:
+        Sexagesimal:  13:58:09.72 -64:44:05.26 1.5
+        Decimal deg:  209.540 -64.735 2.0
+        No radius:    209.540 -64.735          (defaults to 2.0 arcsec)
+    
+    Returns list of dicts with 'ra_deg', 'dec_deg', 'radius_arcsec'.
+    """
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
+    
+    DEFAULT_RADIUS_ARCSEC = 2.0
+    
+    targets = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            ra_str, dec_str = parts[0], parts[1]
+            radius = float(parts[2]) if len(parts) >= 3 else DEFAULT_RADIUS_ARCSEC
+            
+            if ':' in ra_str:
+                coord = SkyCoord(ra_str, dec_str, unit=(u.hourangle, u.deg))
+            else:
+                coord = SkyCoord(float(ra_str), float(dec_str), unit=u.deg)
+            
+            targets.append({
+                'ra_deg': coord.ra.deg,
+                'dec_deg': coord.dec.deg,
+                'radius_arcsec': radius
+            })
+    
+    return targets
+
 
 # ============================================================================
 # LOGGING SETUP
@@ -297,7 +348,9 @@ def calculate_rejection_quality(n_used, n_total, config):
     
     rejected_fraction = (n_total - n_used) / n_total
     
-    if rejected_fraction >= rejection_thresh['medium']:
+    if rejected_fraction >= rejection_thresh['poor']:
+        return "VERY POOR", rejected_fraction
+    elif rejected_fraction >= rejection_thresh['medium']:
         return "POOR", rejected_fraction
     elif rejected_fraction >= rejection_thresh['good']:
         return "MEDIUM", rejected_fraction
@@ -361,7 +414,6 @@ def gunzip_files(input_dir, verbose=False):
         except Exception as e:
             logging.warning(f"  Failed to decompress {gz_path}: {e}")
 
-# # # ASRTROMETRY FUNCTION, TO COPY SOMEWHERE ELSE SINCE THIS IS GOLD
 def try_astrometry(data, header, catalog_df, config, scale_constraint, filter_name, verbose=False, _is_reflection=False, attempt_offset=0, total_attempts=None):
     """Attempt astrometric calibration using quad-matching algorithm.
     
@@ -532,7 +584,6 @@ def try_astrometry(data, header, catalog_df, config, scale_constraint, filter_na
                 CAT = np.array([[s['x'], s['y'], s['mag']] for s in cat_sources_bright])
                 cat_table = Table([CAT[:, 0], CAT[:, 1], CAT[:, 2]], names=('X', 'Y', 'MAG'))
 
-                print_best_only = bool(astrometry_cfg.get('print_best_only', False))
                 if not print_best_only:
                     logging.info(f"    Building quads from {len(det_table)} det and {len(cat_table)} cat sources...")
                 det_quads = build_quads_heap(det_table, G=astrometry_cfg['num_quads'])
@@ -568,7 +619,6 @@ def try_astrometry(data, header, catalog_df, config, scale_constraint, filter_na
 
                 if not print_best_only:
                     logging.info(f"    Evaluating {top_matches} quad matches for consensus...")
-                print_best_only = bool(astrometry_cfg.get('print_best_only', False))
 
                 for match in matches[:top_matches]:
                     try:
@@ -734,19 +784,19 @@ def try_astrometry(data, header, catalog_df, config, scale_constraint, filter_na
                             if scale_bin:
                                 s_key = float(int(med_s / scale_bin) * scale_bin)
                             else:
-                                s_key = round(med_s, scale_dec)
+                                s_key = round(med_s, 4)
 
                             if angle_bin:
                                 a_key = float(int(med_a / angle_bin) * angle_bin)
                             else:
-                                a_key = round(med_a, angle_dec)
+                                a_key = round(med_a, 2)
 
                             if trans_bin:
                                 tx_key = float(int(med_tx / trans_bin) * trans_bin)
                                 ty_key = float(int(med_ty / trans_bin) * trans_bin)
                             else:
-                                tx_key = round(med_tx, trans_dec)
-                                ty_key = round(med_ty, trans_dec)
+                                tx_key = round(med_tx, 1)
+                                ty_key = round(med_ty, 1)
 
                             new_key = (s_key, a_key, tx_key, ty_key)
                             new_groups[new_key] = trans_list
@@ -888,21 +938,46 @@ def try_astrometry(data, header, catalog_df, config, scale_constraint, filter_na
                 ])
                 t_final = np.array([median_tx, median_ty])
 
+                # Use DETECTED pixel positions for WCS fitting (not transformed catalog positions).
+                # Transform catalog→detector to find matches, then use the actual detected coords.
                 cat_all_coords = np.array([[s['x'], s['y']] for s in cat_sources])
                 cat_all_transformed = median_scale * (cat_all_coords @ R_final.T) + t_final
 
-                cat_sky_all = SkyCoord(
-                    ra=[s['ra'] for s in cat_sources] * u.deg,
-                    dec=[s['dec'] for s in cat_sources] * u.deg
+                # Match transformed catalog positions to detected positions
+                tree_det = cKDTree(det_coords_all)
+                dists_wcs, idx_wcs = tree_det.query(cat_all_transformed, k=1)
+                wcs_matched = dists_wcs < pix_tol
+
+                # Ensure unique matches (one detection per catalog source)
+                used_det = set()
+                wcs_cat_indices = []
+                wcs_det_indices = []
+                # Sort by distance so closest matches win
+                order = np.argsort(dists_wcs)
+                for ci in order:
+                    if not wcs_matched[ci]:
+                        continue
+                    di = idx_wcs[ci]
+                    if di in used_det:
+                        continue
+                    used_det.add(di)
+                    wcs_cat_indices.append(ci)
+                    wcs_det_indices.append(di)
+
+                # Build WCS from detected pixel positions + catalog sky coordinates
+                wcs_xy = det_coords_all[wcs_det_indices]  # actual detected pixel positions
+                wcs_sky = SkyCoord(
+                    ra=[cat_sources[i]['ra'] for i in wcs_cat_indices] * u.deg,
+                    dec=[cat_sources[i]['dec'] for i in wcs_cat_indices] * u.deg
                 )
 
 
 
                 try:
-                    logging.info(f"Fitting WCS with {len(cat_all_transformed)} sources...")
+                    logging.info(f"Fitting WCS with {len(wcs_xy)} matched sources (detected pixels + catalog sky)...")
                     wcs = fit_wcs_from_points(
-                        xy=cat_all_transformed.T,
-                        world_coords=cat_sky_all,
+                        xy=wcs_xy.T,
+                        world_coords=wcs_sky,
                         projection=astrometry_cfg.get('wcs_projection', 'TAN'),
                         sip_degree=astrometry_cfg.get('sip_degree', 3)
                     )
@@ -1035,20 +1110,11 @@ def filter_and_prepare_files(input_dir, config, verbose=False):
             if data is not None and len(data.shape) == 2:
                 data = data.astype(np.float32)
 
-                # Track NaNs before masks
-                n_nan_before = np.sum(~np.isfinite(data))
-
-                # Prepare union mask (False = keep, True = mask)
-                mask_applied = np.zeros_like(data, dtype=bool)
-
                 # Option 1: File-based mask (0=bad -> NaN)
-                n_mask_file = 0
                 if bad_pixel_mask is not None:
                     if bad_pixel_mask.shape == data.shape:
                         mask_file_mask = (bad_pixel_mask == 0)
                         data[mask_file_mask] = np.nan
-                        mask_applied |= mask_file_mask
-                        n_mask_file = int(np.sum(mask_file_mask))
                     else:
                         logging.warning(f"  Mask file shape {bad_pixel_mask.shape} != image {data.shape}; skipping mask file for {fits_file}")
 
@@ -1253,194 +1319,6 @@ def validate_groups(groups, verbose=False):
     return valid_groups, incomplete_groups, defective_groups
 
 
-def apply_thermal_residual_correction(skysub_files_by_group, config, output_dir, verbose=False):
-    """Apply thermal residual correction to sky-subtracted files.
-    
-    The thermal pattern scales linearly with exposure time.  We build a
-    template at a reference exposure (10 s) and subtract it scaled by each
-    file's actual EXPTIME.
-    
-    Algorithm (per filter, dither_angle group):
-    1. Collect all skysub files for this (filter, dither_angle)
-    2. Scale every file to 10 s equivalent: data_scaled = data × (10 / EXPTIME)
-    3. Create thermal template = median(data_scaled)  → pattern at 10 s
-    4. Zero-centre the template (remove sky offset)
-    5. For each file compute α = EXPTIME / 10
-    6. Apply: corrected = data − α × template
-    7. Update file in place (overwrite)
-    
-    Args:
-        skysub_files_by_group: List of tuples (group_key, skysub_files) where
-                               group_key = (object, filter, obsid, subid)
-                               skysub_files = list of dicts with 'path', 'data', 'noise', 'header'
-        config: Pipeline configuration dictionary
-        output_dir: Directory where skysub files are stored
-        verbose: Enable verbose logging
-    
-    Returns:
-        int: Number of files corrected
-    """
-    enable_thermal = config.get('calibration', {}).get('enable_thermal_correction', True)
-    thermal_filters = config.get('calibration', {}).get('thermal_filters', ['J', 'H', 'K', 'Z'])
-    THERMAL_REF_EXPTIME = 10.0  # Reference exposure time [seconds]
-
-    # Thermal diversity requirements from config
-    thermal_cfg = config.get('calibration', {}).get('thermal_requirements', {})
-    min_files_thermal = thermal_cfg.get('min_files', 10)
-    min_positions_thermal = thermal_cfg.get('min_positions', 3)
-    min_separation_arcsec = thermal_cfg.get('min_separation_arcsec', 10.0)
-
-    if not enable_thermal:
-        if verbose:
-            logging.info("  Thermal residual correction disabled in config")
-        return 0
-    
-    if verbose:
-        logging.info("")
-        logging.info("Applying thermal residual correction...")
-    
-    # Group all skysub files by (filter, dither_angle)
-    from collections import defaultdict
-    grouped = defaultdict(list)
-    
-    for group_key, skysub_files in skysub_files_by_group:
-        filt = group_key[1]  # (object, filter, obsid, subid)
-        
-        if filt not in thermal_filters:
-            continue
-        
-        for sf in skysub_files:
-            header = sf['header']
-            
-            # Get dither angle
-            if 'DITHANGL' in header:
-                dither_angle = header['DITHANGL']
-            elif 'DWANGLE' in header:
-                dither_angle = (header['DWANGLE'] - 72.0) % 360
-            else:
-                dither_angle = 0.0
-            
-            dither_angle_rounded = int(round(dither_angle / 72.0) * 72) % 360
-            thermal_key = (filt, dither_angle_rounded)
-            
-            grouped[thermal_key].append(sf)
-    
-    total_corrected = 0
-    
-    for (filt, dither_angle), files in grouped.items():
-        if len(files) < min_files_thermal:
-            if verbose:
-                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: only {len(files)} files (need ≥{min_files_thermal})")
-            continue
-
-        # --- RA/DEC diversity check ---------------------------------------------------
-        # Collect unique pointings and verify they are sufficiently separated.
-        positions = []
-        for sf in files:
-            ra_val = sf['header'].get('RA', None)
-            dec_val = sf['header'].get('DEC', None)
-            if ra_val is not None and dec_val is not None:
-                try:
-                    positions.append((float(ra_val), float(dec_val)))
-                except (ValueError, TypeError):
-                    pass
-
-        if not positions:
-            if verbose:
-                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: no RA/DEC in headers")
-            continue
-
-        # Cluster positions: two pointings are "the same" if < min_separation_arcsec apart
-        unique_positions = [positions[0]]
-        for ra_i, dec_i in positions[1:]:
-            coord_i = SkyCoord(ra=ra_i, dec=dec_i, unit='deg')
-            is_new = True
-            for ra_u, dec_u in unique_positions:
-                coord_u = SkyCoord(ra=ra_u, dec=dec_u, unit='deg')
-                if coord_i.separation(coord_u).arcsec < min_separation_arcsec:
-                    is_new = False
-                    break
-            if is_new:
-                unique_positions.append((ra_i, dec_i))
-
-        if len(unique_positions) < min_positions_thermal:
-            if verbose:
-                logging.info(f"  Skipping {filt} dither{dither_angle:03d}: only {len(unique_positions)} "
-                             f"unique positions (need ≥{min_positions_thermal}, separation ≥{min_separation_arcsec}\"")
-            continue
-        
-        # Build template at reference exposure (10 s):
-        # scale every file to 10 s equivalent, then take the median.
-        scaled_stack = []
-        for sf in files:
-            if 'data' in sf and sf['data'] is not None:
-                data_i = sf['data']
-            else:
-                with fits.open(sf['path']) as hdul:
-                    data_i = hdul[0].data.astype(np.float32)
-            
-            exptime = sf['header'].get('EXPTIME', THERMAL_REF_EXPTIME)
-            if exptime <= 0:
-                exptime = THERMAL_REF_EXPTIME
-            scale_factor = THERMAL_REF_EXPTIME / exptime
-            scaled_stack.append(data_i * scale_factor)
-        
-        # Thermal template at 10 s equivalent
-        template = np.nanmedian(np.array(scaled_stack), axis=0)
-        
-        # Zero-centre (remove any residual sky offset so we only subtract the pattern)
-        template_centered = template - np.nanmedian(template)
-        
-        if verbose:
-            logging.info(f"  Created thermal template for {filt} dither{dither_angle:03d} "
-                        f"from {len(files)} files (ref={THERMAL_REF_EXPTIME}s)")
-        
-        # Apply correction to each file: α = EXPTIME / 10
-        for i, sf in enumerate(files):
-            if 'data' in sf and sf['data'] is not None:
-                data = sf['data']
-            else:
-                with fits.open(sf['path']) as hdul:
-                    data = hdul[0].data.astype(np.float32)
-            
-            # Ensure noise is loaded in memory for subsequent pipeline steps
-            if 'noise' not in sf or sf['noise'] is None:
-                with fits.open(sf['path']) as hdul:
-                    if len(hdul) > 1 and hdul[1].name == 'NOISE':
-                        sf['noise'] = hdul[1].data.astype(np.float32)
-                    else:
-                        sf['noise'] = np.sqrt(np.abs(data))
-            
-            exptime = sf['header'].get('EXPTIME', THERMAL_REF_EXPTIME)
-            if exptime <= 0:
-                exptime = THERMAL_REF_EXPTIME
-            alpha = exptime / THERMAL_REF_EXPTIME
-            
-            # Apply correction: corrected = data − α × template_10s
-            data_corrected = data - alpha * template_centered
-            
-            # Update in memory
-            sf['data'] = data_corrected
-            
-            # Update file on disk
-            with fits.open(sf['path'], mode='update') as hdul:
-                hdul[0].data = data_corrected
-                hdul[0].header['HISTORY'] = (f'Thermal correction: alpha={alpha:.4f} '
-                                             f'(EXPTIME={exptime:.1f}s / ref={THERMAL_REF_EXPTIME:.0f}s)')
-                hdul[0].header['THMALPHA'] = (alpha, 'Thermal correction scaling (EXPTIME/ref)')
-                hdul.flush()
-            
-            total_corrected += 1
-        
-        if verbose:
-            logging.info(f"    Corrected {len(files)} files for {filt} dither{dither_angle:03d}")
-    
-    if verbose:
-        logging.info(f"  Total thermal corrections applied: {total_corrected}")
-    
-    return total_corrected
-
-
 def process_group_sky_subtraction(group, config, output_dir, verbose=False):
     """Perform sky subtraction and flat field correction on a dither group.
     
@@ -1450,8 +1328,6 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
        then scale all frames so medians equal the mean of all medians
     3. Create single sky from median of all N leveled frames
     4. Sky subtract and flat field: (raw - sky) / flat
-    
-    Thermal correction is now done AFTER this step, using the skysub files.
     
     Noise propagation:
     - Input noise = sqrt(data_raw/gain + (read_noise/gain)^2)  [all in ADU]
@@ -1540,16 +1416,169 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
     if verbose:
         logging.info(f"    Leveled {len(data_leveled)} frames to mean median={mean_median:.1f}")
     
+    # ========== STEP 3b: BUILD SKY + POST-MEDIAN RESIDUAL CLEANUP ==========
+    # Physically motivated sky model:
+    # 1) build per-frame source masks, 2) masked median sky from all frames,
+    # 3) optional small post-cleanup of bright residual patches.
+    
+    sky_mask_cfg = config.get('sky_subtraction', {}).get('source_masking', {})
+    sm_thresh = sky_mask_cfg.get('threshold_sigma', 2.0)
+    sm_minarea = sky_mask_cfg.get('min_area', 3)
+    sm_bw = sky_mask_cfg.get('bw', 64)
+    sm_bh = sky_mask_cfg.get('bh', 64)
+    sm_grow = sky_mask_cfg.get('grow_radius', 3.5)
+    sm_grow_max = sky_mask_cfg.get('grow_radius_max', 10.0)
+    sm_bright_scale = sky_mask_cfg.get('bright_grow_scale', 0.4)
+    sm_bright_ref = sky_mask_cfg.get('bright_flux_ref', 500.0)
+    
     # ========== STEP 4: CREATE SINGLE SKY FROM ALL N FRAMES ==========
     data_stack = np.array(data_leveled)
-    sky_pattern = np.nanmedian(data_stack, axis=0)
-    
-    # Sky noise (using all N frames)
     noise_stack = np.array(noise_leveled)
-    var_stack = np.nansum(noise_stack**2, axis=0)
-    N_eff = np.sum(np.isfinite(data_stack), axis=0)
-    N_eff[N_eff == 0] = 1
-    noise_sky = config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_stack) / N_eff
+
+    if sky_mask_cfg.get('enabled', False):
+        source_masks = []
+        masked_frac_list = []
+        for data_lev in data_leveled:
+            try:
+                work = np.ascontiguousarray(np.nan_to_num(data_lev, nan=0.0).astype(np.float32))
+                nan_mask = ~np.isfinite(data_lev)
+                bkg = sep.Background(work, bw=sm_bw, bh=sm_bh, mask=nan_mask)
+                sub = work - bkg.back()
+                objs = sep.extract(sub, sm_thresh * bkg.globalrms,
+                                   minarea=sm_minarea, mask=nan_mask)
+                src_mask = nan_mask.copy()
+                for obj in objs:
+                    try:
+                        flux = float(obj['flux'])
+                        if flux > sm_bright_ref:
+                            r_eff = sm_grow * (1.0 + sm_bright_scale *
+                                               np.log10(flux / sm_bright_ref))
+                            r_eff = min(r_eff, sm_grow_max)
+                        else:
+                            r_eff = sm_grow
+                        sep.mask_ellipse(src_mask, obj['x'], obj['y'],
+                                         obj['a'], obj['b'], obj['theta'],
+                                         r=r_eff)
+                    except Exception:
+                        pass
+            except Exception:
+                src_mask = ~np.isfinite(data_lev)
+
+            source_masks.append(src_mask)
+            masked_frac_list.append(float(np.mean(src_mask)))
+
+        mask_stack = np.array(source_masks)
+        data_masked = np.where(mask_stack, np.nan, data_stack)
+        sky_pattern = np.nanmedian(data_masked, axis=0)
+
+        # If some pixels are masked in all frames, fall back to unmasked median.
+        missing = ~np.isfinite(sky_pattern)
+        if np.any(missing):
+            sky_pattern_fallback = np.nanmedian(data_stack, axis=0)
+            sky_pattern[missing] = sky_pattern_fallback[missing]
+
+        # Sky noise from the same (masked) contributors used in sky construction.
+        contrib = np.isfinite(data_masked) & np.isfinite(noise_stack)
+        var_stack = np.sum(np.where(contrib, noise_stack**2, 0.0), axis=0)
+        N_eff = np.sum(contrib, axis=0)
+
+        # Fallback where masking removed all contributors.
+        no_contrib = N_eff == 0
+        if np.any(no_contrib):
+            contrib_unmasked = np.isfinite(data_stack) & np.isfinite(noise_stack)
+            var_unmasked = np.sum(np.where(contrib_unmasked, noise_stack**2, 0.0), axis=0)
+            n_unmasked = np.sum(contrib_unmasked, axis=0)
+            var_stack[no_contrib] = var_unmasked[no_contrib]
+            N_eff[no_contrib] = np.maximum(n_unmasked[no_contrib], 1)
+
+        noise_sky = config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_stack) / N_eff
+
+        if verbose:
+            mean_masked = 100.0 * float(np.mean(masked_frac_list))
+            logging.info(f"    Sky masks: mean masked area {mean_masked:.1f}% (grow={sm_grow})")
+    else:
+        sky_pattern = np.nanmedian(data_stack, axis=0)
+
+        # Sky noise (using all N frames)
+        var_stack = np.nansum(noise_stack**2, axis=0)
+        N_eff = np.sum(np.isfinite(data_stack), axis=0)
+        N_eff[N_eff == 0] = 1
+        noise_sky = config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_stack) / N_eff
+    
+    # ========== STEP 4b: CLEAN RESIDUAL POSITIVE PATCHES IN SKY ==========
+    # After the median, detect positive residual clusters (surviving star
+    # flux) and replace them with values sampled from neighboring sky pixels
+    # so the cleaned region has the same local mean and standard deviation.
+    if sky_mask_cfg.get('enabled', False):
+        try:
+            sky_work = np.ascontiguousarray(
+                np.nan_to_num(sky_pattern, nan=0.0).astype(np.float32))
+            nan_mask_sky = ~np.isfinite(sky_pattern)
+            bkg_sky = sep.Background(sky_work, bw=sm_bw, bh=sm_bh, mask=nan_mask_sky)
+            sky_sub = sky_work - bkg_sky.back()
+            sky_rms = bkg_sky.globalrms
+            
+            # Detect only the surviving positive residuals
+            residual_objs = sep.extract(sky_sub, sm_thresh * sky_rms,
+                                         minarea=sm_minarea, mask=nan_mask_sky)
+            
+            if len(residual_objs) > 0:
+                # Build mask of contaminated pixels (tight: just the detected footprint)
+                contam_mask = nan_mask_sky.copy()
+                for obj in residual_objs:
+                    try:
+                        sep.mask_ellipse(contam_mask, obj['x'], obj['y'],
+                                         obj['a'], obj['b'], obj['theta'],
+                                         r=2.0)
+                    except Exception:
+                        pass
+                
+                # For each contaminated pixel, replace with local robust estimate
+                # from nearby uncontaminated sky pixels.
+                ny_s, nx_s = sky_pattern.shape
+                clean_sky = sky_pattern.copy()
+                contam_yx = np.argwhere(contam_mask & ~nan_mask_sky)
+                
+                if len(contam_yx) > 0:
+                    # Build a pool of clean sky pixel values for local sampling
+                    annulus_inner = 5
+                    annulus_outer = 15
+                    
+                    for cy, cx in contam_yx:
+                        # Collect clean pixels in an annulus around this pixel
+                        y_lo = max(0, cy - annulus_outer)
+                        y_hi = min(ny_s, cy + annulus_outer + 1)
+                        x_lo = max(0, cx - annulus_outer)
+                        x_hi = min(nx_s, cx + annulus_outer + 1)
+                        
+                        local_patch = sky_pattern[y_lo:y_hi, x_lo:x_hi]
+                        local_contam = contam_mask[y_lo:y_hi, x_lo:x_hi]
+                        local_nan = nan_mask_sky[y_lo:y_hi, x_lo:x_hi]
+                        
+                        # Only use pixels outside inner radius and not contaminated
+                        yy, xx = np.mgrid[y_lo:y_hi, x_lo:x_hi]
+                        dist2 = (yy - cy)**2 + (xx - cx)**2
+                        in_annulus = (dist2 >= annulus_inner**2) & (dist2 <= annulus_outer**2)
+                        good = in_annulus & ~local_contam & ~local_nan & np.isfinite(local_patch)
+                        
+                        pool = local_patch[good]
+                        if len(pool) >= 5:
+                            # Use local median to avoid injecting fixed random texture
+                            # that can create positive/negative residual twins in skysub frames.
+                            clean_sky[cy, cx] = np.median(pool)
+                        else:
+                            # Fallback: use local background estimate
+                            clean_sky[cy, cx] = bkg_sky.back()[cy, cx]
+                    
+                    sky_pattern = clean_sky
+                    
+                    if verbose:
+                        n_res = len(residual_objs)
+                        pct = len(contam_yx) / sky_pattern.size * 100
+                        logging.info(f"    Sky cleanup: {n_res} residual patches, "
+                                     f"{len(contam_yx)} pixels ({pct:.2f}%) replaced")
+        except Exception:
+            pass  # keep original sky_pattern
     
     # Save sky pattern
     sky_filename = f"{group_name}_sky.fits"
@@ -1571,6 +1600,41 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         logging.info(f"    Created single sky pattern from {len(files)} frames")
     
     # ========== STEP 5: SKY SUBTRACTION + FLAT FIELD ==========
+    # Check if LOO + Iterative Gaussian mode is enabled (supports per-filter override)
+    loo_ig_cfg = config.get('sky_subtraction', {}).get('loo_iterative_gauss', {})
+    use_loo_ig = loo_ig_cfg.get('enabled', False)
+    
+    # Per-filter override: filter_enable map takes precedence over global 'enabled'
+    filter_enable = loo_ig_cfg.get('filter_enable', {})
+    if filt in filter_enable:
+        use_loo_ig = bool(filter_enable[filt])
+    
+    if verbose:
+        logging.info(f"    LOO+IterGauss for filter {filt}: {'enabled' if use_loo_ig else 'disabled'}")
+    
+    if use_loo_ig:
+        # LOO sky: for each frame, sky = median of the OTHER N-1 frames
+        # Median naturally rejects dithered sources; residual cleanup
+        # already applied to sky_pattern above via the same mechanism
+        loo_skies = []
+        for i in range(len(data_leveled)):
+            others = [data_leveled[j] for j in range(len(data_leveled)) if j != i]
+            loo_skies.append(np.nanmedian(np.array(others), axis=0))
+        
+        # LOO noise: each sky built from N-1 frames
+        loo_noise_skies = []
+        for i in range(len(noise_leveled)):
+            others_n = [noise_leveled[j] for j in range(len(noise_leveled)) if j != i]
+            var_loo = np.nansum(np.array(others_n)**2, axis=0)
+            N_loo = np.sum(np.isfinite(np.array([data_leveled[j] for j in range(len(data_leveled)) if j != i])), axis=0)
+            N_loo[N_loo == 0] = 1
+            loo_noise_skies.append(
+                config['sky_subtraction']['noise_median_factor'] * np.sqrt(var_loo) / N_loo
+            )
+        
+        if verbose:
+            logging.info(f"    LOO+IterGauss mode: building leave-one-out skies")
+    
     # Formula: (raw_leveled - sky) / flat
     # Note: flat division done AFTER sky subtraction (standard practice)
     skysub_files = []
@@ -1581,9 +1645,13 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
     for i, (data_lev, noise_in, file_info, header) in enumerate(
             zip(data_leveled, noise_leveled, files, headers)):
         
-        # Sky subtract
-        data_skysub = data_lev - sky_pattern
-        noise_skysub = np.sqrt(noise_in**2 + noise_sky**2)
+        # Sky subtract: LOO sky or standard sky
+        if use_loo_ig:
+            data_skysub = data_lev - loo_skies[i]
+            noise_skysub = np.sqrt(noise_in**2 + loo_noise_skies[i]**2)
+        else:
+            data_skysub = data_lev - sky_pattern
+            noise_skysub = np.sqrt(noise_in**2 + noise_sky**2)
         
         # Get dither angle for flat field loading
         if 'DITHANGL' in header:
@@ -1615,6 +1683,113 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         data_final = data_skysub / flat
         noise_final = noise_skysub / flat
         
+        # LOO + Iterative Gaussian background correction (after flat division)
+        if use_loo_ig:
+            ig_n_iter = loo_ig_cfg.get('n_iter', 3)
+            ig_base_sigma = loo_ig_cfg.get('base_sigma', 15.0)
+            ig_decay = loo_ig_cfg.get('sigma_decay', 0.8)
+            ig_sigma_thresh = loo_ig_cfg.get('source_sigma', 1.8)
+            ig_grow_base = loo_ig_cfg.get('source_grow_base', 4.0)
+            
+            current = data_final.copy()
+            # Track cumulative variance added by subtracting smooth backgrounds.
+            # Each iteration subtracts bg_k = GaussianSmooth(image, σ_k).
+            # The variance of bg_k at each pixel ≈ local_var / (2π σ_k²),
+            # where the effective number of independent pixels in the kernel
+            # is N_eff = 2π σ_k².  We propagate this through the noise map.
+            ig_added_var = np.zeros_like(noise_final)
+            
+            # Build source mask ONCE before the loop.  Re-detecting sources
+            # at every iteration caused inconsistent masks across iterations
+            # and frames, producing negative "holes" in the coadd.
+            work = np.ascontiguousarray(current.astype(np.float32))
+            nan_mask = ~np.isfinite(work)
+            work[nan_mask] = 0.0
+            try:
+                bkg = sep.Background(work, bw=64, bh=64, fw=3, fh=3, mask=nan_mask)
+                sub = work - bkg.back()
+                source_mask = nan_mask.copy()
+                objs = sep.extract(sub, ig_sigma_thresh * bkg.globalrms,
+                                   minarea=5, mask=nan_mask)
+                for obj in objs:
+                    try:
+                        sep.mask_ellipse(source_mask, obj['x'], obj['y'],
+                                         obj['a'], obj['b'], obj['theta'],
+                                         r=ig_grow_base)
+                    except Exception:
+                        pass
+            except Exception:
+                source_mask = nan_mask.copy()
+            
+            for it in range(ig_n_iter):
+                sig = ig_base_sigma * (ig_decay ** it)
+                # Normalized convolution: smooth data and weight separately,
+                # then divide.  This interpolates across masked regions
+                # using only nearby good pixels.
+                bad = source_mask | ~np.isfinite(current)
+                filled = current.copy()
+                filled[bad] = 0.0
+                weight = (~bad).astype(np.float64)
+                smooth_data = gaussian_filter(filled.astype(np.float64), sigma=sig)
+                smooth_weight = gaussian_filter(weight, sigma=sig)
+                bg = np.zeros_like(smooth_data, dtype=np.float32)
+                ok = smooth_weight > 0.01
+                bg[ok] = (smooth_data[ok] / smooth_weight[ok]).astype(np.float32)
+                current = current - bg
+                
+                # Noise propagation: variance of the smooth bg model
+                # var(bg_k) = var(pixel) / N_eff, where N_eff = 2π σ²
+                n_eff = 2.0 * np.pi * sig * sig
+                ig_added_var += noise_final**2 / n_eff
+            
+            data_final = current
+            # Final noise: original variance + variance from subtracting bg models
+            noise_final = np.sqrt(noise_final**2 + ig_added_var)
+            
+            if verbose and i == 0:  # log once per group
+                logging.info(f"    Applied IterGauss: {ig_n_iter} iter, "
+                             f"base_sigma={ig_base_sigma}, decay={ig_decay}")
+
+        # Optional detector-domain spike masking.
+        # Removes isolated hot/dead pixels that are fixed in detector coordinates
+        # and otherwise project as pentagonal artifacts in dither coadds.
+        dam_cfg = config.get('sky_subtraction', {}).get('detector_artifact_mask', {})
+        if dam_cfg.get('enabled', True):
+            spike_sigma = float(dam_cfg.get('spike_sigma', 8.0))
+            max_cluster = int(dam_cfg.get('max_cluster_pixels', 1))
+            include_negative = bool(dam_cfg.get('include_negative', True))
+            min_abs_adu = float(dam_cfg.get('min_abs_adu', 0.0))
+
+            finite = np.isfinite(data_final)
+            work = np.where(finite, data_final, 0.0)
+            local_med = median_filter(work, size=3, mode='nearest')
+            delta = data_final - local_med
+
+            finite_noise = np.isfinite(noise_final) & (noise_final > 0)
+            if np.any(finite_noise):
+                noise_floor = float(np.nanmedian(noise_final[finite_noise]))
+            else:
+                noise_floor = 1.0
+            sigma_ref = np.where(finite_noise, noise_final, noise_floor)
+
+            cand_pos = finite & (delta > spike_sigma * sigma_ref)
+            cand_neg = finite & (delta < -spike_sigma * sigma_ref) if include_negative else np.zeros_like(cand_pos)
+            candidates = cand_pos | cand_neg
+            if min_abs_adu > 0:
+                candidates &= (np.abs(delta) >= min_abs_adu)
+
+            # Keep only isolated/small clusters to avoid clipping real stellar cores.
+            neigh_count = uniform_filter(candidates.astype(np.float32), size=3, mode='nearest') * 9.0
+            artifact_mask = candidates & (neigh_count <= (max_cluster + 0.5))
+
+            n_art = int(np.sum(artifact_mask))
+            if n_art > 0:
+                data_final[artifact_mask] = np.nan
+                noise_final[artifact_mask] = np.nan
+                if verbose and i == 0:
+                    logging.info(f"    Detector artifact mask: removed {n_art} isolated spikes "
+                                 f"(sigma={spike_sigma}, max_cluster={max_cluster})")
+        
         # Handle non-finite values
         noise_final[~np.isfinite(data_final)] = np.nan
         
@@ -1626,7 +1801,11 @@ def process_group_sky_subtraction(group, config, output_dir, verbose=False):
         skysub_header['PSTATSUB'] = config['fits_markers']['pstatsub_skysub']
         skysub_header['FILENAME'] = skysub_filename
         skysub_header['DATE'] = format_date_like_dateobs(header['DATE-OBS'])
-        skysub_header['HISTORY'] = f"Sky subtracted (median of {len(files)} frames)"
+        if use_loo_ig:
+            skysub_header['HISTORY'] = f"LOO sky subtracted (median of {len(files)-1} frames)"
+            skysub_header['HISTORY'] = f"IterGauss: {loo_ig_cfg.get('n_iter',3)} iter, sigma0={loo_ig_cfg.get('base_sigma',25.0)}"
+        else:
+            skysub_header['HISTORY'] = f"Sky subtracted (median of {len(files)} frames)"
         skysub_header['HISTORY'] = f"Flat fielded after sky subtraction"
         skysub_header['COMMENT'] = "Processing order: level -> sky -> flat"
         
@@ -1675,18 +1854,49 @@ def _fit_similarity_transform(src_coords, dst_coords, weights=None,
     Returns:
         dict with keys: a, b, tx, ty, rotation_deg, scale, rms, n_used, inlier_mask
     """
-    N = len(src_coords)
-    xs, ys = src_coords[:, 0], src_coords[:, 1]
-    xd, yd = dst_coords[:, 0], dst_coords[:, 1]
+    src_coords = np.asarray(src_coords, dtype=np.float64)
+    dst_coords = np.asarray(dst_coords, dtype=np.float64)
+
+    # Keep only finite pairs; NaN/Inf inputs can make LAPACK fail in lstsq.
+    finite_mask = np.isfinite(src_coords).all(axis=1) & np.isfinite(dst_coords).all(axis=1)
 
     if weights is None:
-        w = np.ones(N)
+        w_raw = np.ones(len(src_coords), dtype=np.float64)
     else:
-        w = np.asarray(weights, dtype=np.float64)
-        # Normalise so mean weight = 1 (keeps numerical conditioning stable)
-        wmean = np.mean(w)
-        if wmean > 0:
-            w = w / wmean
+        w_raw = np.asarray(weights, dtype=np.float64)
+        if w_raw.shape[0] != len(src_coords):
+            w_raw = np.ones(len(src_coords), dtype=np.float64)
+
+    finite_mask &= np.isfinite(w_raw)
+
+    src = src_coords[finite_mask]
+    dst = dst_coords[finite_mask]
+    w_in = w_raw[finite_mask]
+
+    N = len(src)
+    if N < 2:
+        return {'a': 1.0, 'b': 0.0, 'tx': 0.0, 'ty': 0.0,
+                'rotation_deg': 0.0, 'scale': 1.0,
+                'rms': np.inf, 'n_used': 0, 'inlier_mask': np.zeros(N, dtype=bool)}
+
+    xs, ys = src[:, 0], src[:, 1]
+    xd, yd = dst[:, 0], dst[:, 1]
+
+    w = np.asarray(w_in, dtype=np.float64)
+    # Enforce strictly positive, finite weights to keep WLS stable.
+    w = np.where(np.isfinite(w) & (w > 0), w, 1.0)
+    # Normalise so mean weight = 1 (keeps numerical conditioning stable)
+    wmean = np.mean(w)
+    if np.isfinite(wmean) and wmean > 0:
+        w = w / wmean
+    else:
+        w = np.ones(N, dtype=np.float64)
+
+    # Safe initialization so we always return a transform even if fitting fails.
+    tx0 = float(np.median(xd - xs))
+    ty0 = float(np.median(yd - ys))
+    params = np.array([1.0, 0.0, tx0, ty0], dtype=np.float64)
+    res_per_match = np.sqrt((xd - (xs + tx0))**2 + (yd - (ys + ty0))**2)
 
     inlier = np.ones(N, dtype=bool)
 
@@ -1716,7 +1926,15 @@ def _fit_similarity_transform(src_coords, dst_coords, weights=None,
 
         # Weighted least squares: (A^T W A) p = A^T W b
         AW = A * W_diag[:, None]
-        params, _, _, _ = np.linalg.lstsq(AW, target * W_diag, rcond=None)
+        try:
+            params, _, _, _ = np.linalg.lstsq(AW, target * W_diag, rcond=None)
+        except np.linalg.LinAlgError:
+            # Numerical failure (e.g. SVD non-convergence): keep last stable
+            # parameters and stop refining instead of aborting the pipeline.
+            break
+
+        if not np.all(np.isfinite(params)):
+            break
 
         # Compute per-match residuals on ALL pairs (for sigma-clipping)
         A_full = np.zeros((2 * N, 4))
@@ -1758,17 +1976,21 @@ def _fit_similarity_transform(src_coords, dst_coords, weights=None,
 
 def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False):
     """Refine alignment using source detection, iterative cross-matching,
-    flux-weighted similarity-transform fitting, and sigma-clipping.
+    and sigma-clipped shift fitting.
     
     Algorithm per image:
     1. Compute blind shifts from dither geometry (initial guess)
     2. Detect sources in all images (capped to brightest N)
-    3. Iteration 1: apply blind shift, cross-match with wide tolerance,
-       fit similarity transform with flux weights + sigma-clipping
-    4. Iteration 2: re-project through fitted transform, cross-match with
-       tighter tolerance, re-fit.  Recovers sources that were just outside
-       the initial search radius and tightens the solution.
+    3. Iteration 1: apply blind shift, cross-match with KDTree,
+       fit sigma-clipped median shift (or optionally similarity transform)
+    4. Iteration 2: re-project through fitted shift, cross-match with
+       tighter tolerance, re-fit.  Recovers borderline matches.
     5. Return refined transforms if enough matches, blind shift otherwise.
+    
+    By default uses shift-only fitting (2 parameters: dx, dy) which is 2x
+    more precise than similarity transform (4 params: a, b, tx, ty) for
+    REMIR's wedge-prism dither pattern where inter-frame rotation is <0.02°.
+    Similarity transform fitting available via fit_mode: similarity config.
     
     Args:
         skysub_files: List of dicts with 'data', 'noise', 'header', 'path'
@@ -1804,6 +2026,10 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
     n_refine_iters = refine_cfg.get('n_refine_iters', 2)
     sigma_clip_iters = refine_cfg.get('sigma_clip_iters', 3)
     sigma_clip_threshold = refine_cfg.get('sigma_clip_threshold', 3.0)
+    fit_mode = refine_cfg.get('fit_mode', 'shift')  # 'shift' or 'similarity'
+    
+    if verbose:
+        logging.info(f"  Alignment fit mode: {fit_mode}")
     
     # First compute blind shifts from dither geometry
     alignment_config = config['alignment'][system]
@@ -1910,31 +2136,86 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
             match_fraction = n_matched / len(template_sources) if len(template_sources) > 0 else 0
             
             if n_matched < min_matches or match_fraction < min_match_fraction:
-                # Not enough matches at this iteration
                 if refine_iter == 0:
-                    # First pass failed entirely
-                    break
+                    # First pass failed — rescue with progressively wider tolerance
+                    rescued = False
+                    for rescue_factor in [2, 4, 8]:
+                        rescue_tol = pix_tol * rescue_factor
+                        dists_r, indices_r = tree.query(projected, distance_upper_bound=rescue_tol)
+                        mask_r = dists_r < rescue_tol
+                        n_r = np.sum(mask_r)
+                        frac_r = n_r / len(template_sources) if len(template_sources) > 0 else 0
+                        if n_r >= min_matches and frac_r >= min_match_fraction:
+                            matched_mask = mask_r
+                            indices = indices_r
+                            n_matched = n_r
+                            match_fraction = frac_r
+                            rescued = True
+                            if verbose:
+                                logging.info(f"    Image {idx}: Rescued with {rescue_factor}x tolerance "
+                                           f"({rescue_tol:.1f}px): {n_r} matches ({frac_r:.1%})")
+                            break
+                    if not rescued:
+                        break
                 else:
                     # Keep previous iteration's result
                     break
             
-            # Get matched pairs — use ORIGINAL (unshifted) image coords for transform fit
+            # Get matched pairs
             matched_img_orig = img_coords[matched_mask]
             matched_tmpl = template_coords[indices[matched_mask]]
             
-            # Flux-based weights: geometric mean of source fluxes in both images
-            # Use sqrt(flux) so very bright stars don't completely dominate
-            w_img = np.sqrt(img_fluxes[matched_mask])
-            w_tmpl = np.sqrt(template_fluxes[indices[matched_mask]])
-            match_weights = np.sqrt(w_img * w_tmpl)
+            if fit_mode == 'similarity':
+                # Full similarity transform (rotation + scale + translation)
+                w_img = np.sqrt(img_fluxes[matched_mask])
+                w_tmpl = np.sqrt(template_fluxes[indices[matched_mask]])
+                match_weights = np.sqrt(w_img * w_tmpl)
+                transform = _fit_similarity_transform(
+                    matched_img_orig, matched_tmpl,
+                    weights=match_weights,
+                    sigma_clip_iters=sigma_clip_iters,
+                    sigma_clip_threshold=sigma_clip_threshold
+                )
+            else:
+                # Shift-only fitting: sigma-clipped median of (template - shifted) offsets
+                if current_transform is None:
+                    shifted_coords = matched_img_orig + np.array([blind_dx, blind_dy])
+                else:
+                    shifted_coords = np.column_stack([
+                        current_transform['a'] * matched_img_orig[:, 0] - current_transform['b'] * matched_img_orig[:, 1] + current_transform['tx'],
+                        current_transform['b'] * matched_img_orig[:, 0] + current_transform['a'] * matched_img_orig[:, 1] + current_transform['ty']
+                    ])
+                diff = matched_tmpl - shifted_coords
+                inlier = np.ones(len(diff), dtype=bool)
+                for _sc in range(sigma_clip_iters):
+                    if np.sum(inlier) < 3:
+                        break
+                    med = np.median(diff[inlier], axis=0)
+                    d = np.sqrt(np.sum((diff[inlier] - med)**2, axis=1))
+                    mad = np.median(d) * 1.4826
+                    if mad < 1e-6:
+                        break
+                    inlier_sub = d < sigma_clip_threshold * mad
+                    full_inlier = np.where(inlier)[0][inlier_sub]
+                    inlier = np.zeros(len(diff), dtype=bool)
+                    inlier[full_inlier] = True
+                ddx, ddy = np.median(diff[inlier], axis=0)
+                if current_transform is None:
+                    total_tx = blind_dx + ddx
+                    total_ty = blind_dy + ddy
+                else:
+                    total_tx = current_transform['tx'] + ddx
+                    total_ty = current_transform['ty'] + ddy
+                # Compute RMS on residuals after subtracting fitted shift
+                residuals = diff[inlier] - np.array([ddx, ddy])
+                res = np.sqrt(residuals[:, 0]**2 + residuals[:, 1]**2)
+                rms_val = np.sqrt(np.mean(res**2)) if len(res) > 0 else 999.0
+                transform = {
+                    'a': 1.0, 'b': 0.0, 'tx': total_tx, 'ty': total_ty,
+                    'rotation_deg': 0.0, 'scale': 1.0,
+                    'rms': rms_val, 'n_used': int(np.sum(inlier))
+                }
             
-            # Fit similarity transform with flux weighting + sigma-clipping
-            transform = _fit_similarity_transform(
-                matched_img_orig, matched_tmpl,
-                weights=match_weights,
-                sigma_clip_iters=sigma_clip_iters,
-                sigma_clip_threshold=sigma_clip_threshold
-            )
             rms = transform['rms']
             n_used = transform['n_used']
             
@@ -1971,9 +2252,13 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
         })
         
         if verbose:
-            logging.info(f"    Image {idx}: Refined shift dx={eff_dx:.3f}, dy={eff_dy:.3f} "
-                        f"(rot={rot_deg:+.4f} deg, scale={scale:.5f}, "
-                        f"matches={best_n_matched}, used={best_n_used}, RMS={rms:.3f}px)")
+            if fit_mode == 'similarity':
+                logging.info(f"    Image {idx}: Refined shift dx={eff_dx:.3f}, dy={eff_dy:.3f} "
+                            f"(rot={rot_deg:+.4f} deg, scale={scale:.5f}, "
+                            f"matches={best_n_matched}, used={best_n_used}, RMS={rms:.3f}px)")
+            else:
+                logging.info(f"    Image {idx}: Refined shift dx={eff_dx:.3f}, dy={eff_dy:.3f} "
+                            f"(matches={best_n_matched}, used={best_n_used}, RMS={rms:.3f}px)")
     
     if verbose:
         logging.info("  Alignment refinement complete!")
@@ -1981,7 +2266,8 @@ def refine_alignment_with_crossmatch(skysub_files, config, system, verbose=False
     return refined_shifts
 
 
-def drizzle_image(data, noise, transform, output_shape=None, pixfrac=1.0):
+def drizzle_image(data, noise, transform, output_shape=None, pixfrac=1.0,
+                  min_weight_frac=0.0):
     """Apply drizzling with full affine transform (rotation + scale + translation).
     
     VECTORIZED implementation. Each input pixel at position (x, y) maps to output:
@@ -2009,6 +2295,9 @@ def drizzle_image(data, noise, transform, output_shape=None, pixfrac=1.0):
             - 'dx', 'dy' for pure translation (a=1, b=0)
         output_shape: Shape of output array, defaults to input shape
         pixfrac: Pixel fraction (1.0 = full pixel, <1.0 = shrink for sharper PSF)
+        min_weight_frac: Minimum fractional drizzle coverage to keep a pixel.
+                 0 keeps any non-zero overlap; values like 0.1-0.3
+                 suppress low-coverage edge artifacts.
     
     Returns:
         tuple: (drizzled_data, drizzled_noise, weight_map)
@@ -2103,8 +2392,10 @@ def drizzle_image(data, noise, transform, output_shape=None, pixfrac=1.0):
         np.add.at(var_out, (oy_flat, ox_flat), var_flat * area_flat**2)
         np.add.at(weight_out, (oy_flat, ox_flat), area_flat)
     
-    # Normalize by weight (avoid division by zero)
-    mask = weight_out > 1e-10
+    # Normalize by weight (avoid division by zero).
+    # Optionally mask very low-coverage edge pixels that often show stripes.
+    min_weight = max(0.0, float(min_weight_frac)) * (pixfrac ** 2)
+    mask = weight_out > max(1e-10, min_weight)
     drizzled_data = np.full(output_shape, np.nan, dtype=np.float32)
     drizzled_noise = np.full(output_shape, np.nan, dtype=np.float32)
     
@@ -2200,6 +2491,7 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
     aligned_files = []
     
     pixfrac = config['alignment'].get('drizzle_pixfrac', 1.0)  # Pixel fraction for drizzling
+    min_weight_frac = config['alignment'].get('drizzle_min_weight_frac', 0.15)
     
     if verbose:
         logging.info(f"  Applying affine drizzle (pixfrac={pixfrac})...")
@@ -2216,7 +2508,8 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
         # Rotation + scale + translation are handled together — no separate
         # interpolation step, no double-smoothing.
         data_aligned, noise_aligned, weight = drizzle_image(
-            data, noise, shift_info, output_shape=data.shape, pixfrac=pixfrac
+            data, noise, shift_info, output_shape=data.shape,
+            pixfrac=pixfrac, min_weight_frac=min_weight_frac
         )
         
         # Compute effective shift at image center (for logging / FITS headers)
@@ -2243,6 +2536,7 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
         aligned_header['HISTORY'] = f"Applied shift: dx={dx:.3f}, dy={dy:.3f} pixels"
         aligned_header['HISTORY'] = f"Alignment method: {alignment_method} (affine drizzle)"
         aligned_header['HISTORY'] = f"Drizzle pixfrac: {pixfrac}"
+        aligned_header['HISTORY'] = f"Drizzle min coverage frac: {min_weight_frac}"
         if abs(rot_val) > 1e-6 or abs(scale_val - 1.0) > 1e-6:
             aligned_header['HISTORY'] = f"Affine drizzle: rot={rot_val:+.4f} deg, scale={scale_val:.5f}"
         if alignment_method == "blind dither geometry":
@@ -2250,6 +2544,7 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
         aligned_header['ALIGNED'] = (True, 'File has been aligned')
         aligned_header['ALIGNMTH'] = (f"{alignment_method} (affine drizzle)", 'Alignment method used')
         aligned_header['DRZLPIXF'] = (pixfrac, 'Drizzle pixel fraction')
+        aligned_header['DRZLMINW'] = (min_weight_frac, 'Min fractional drizzle coverage kept')
         aligned_header['TEMPLATE'] = (idx == template_idx, 'This is the template file')
         if idx != template_idx:
             aligned_header['SHIFT_X'] = (dx, 'Effective X shift at image center [pixels]')
@@ -2279,14 +2574,17 @@ def align_frames(skysub_files, config, system, output_dir, verbose=False):
 def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, config, verbose=False):
     """Combine aligned frames into a single coadded image.
     
-    Performs inverse-variance weighted combination of aligned frames.
+    Performs inverse-variance weighted combination of aligned frames
+    with iterative positive-outlier sigma-clipping (cosmic ray rejection).
     Drizzle-edge pixels with higher noise automatically receive lower weight,
     producing cleaner coadds with optimal signal-to-noise.
     
     Algorithm:
     1. Compute inverse-variance weights: w_i = 1 / noise_i^2
-    2. Weighted mean: coadd = sum(data_i * w_i) / sum(w_i)
-    3. Optimal noise: noise = sqrt(1 / sum(w_i))
+    2. If >= 3 frames: iteratively clip pixels brighter than sigma_clip × σ
+       above the weighted mean (positive outliers only)
+    3. Weighted mean: coadd = sum(data_i * w_i) / sum(w_i)
+    4. Optimal noise: noise = sqrt(1 / sum(w_i))
     
     The coadd header includes:
     - DITHID=99: Marker for coadded images
@@ -2318,6 +2616,61 @@ def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, c
     var_stack = noise_stack**2
     valid = np.isfinite(data_stack) & np.isfinite(noise_stack) & (var_stack > 0)
     inv_var = np.where(valid, 1.0 / var_stack, 0.0)
+    
+    # Sigma-clipping: reject outliers when >= 3 frames
+    coadd_cfg = config.get('coadd', {})
+    sigma_clip_thresh = coadd_cfg.get('sigma_clip', 4.0)
+    sigma_clip_iters = coadd_cfg.get('sigma_clip_iters', 2)
+    robust_mad_clip = bool(coadd_cfg.get('robust_mad_clip', True))
+    robust_mad_sigma = float(coadd_cfg.get('robust_mad_sigma', 5.0))
+
+    total_rejected = 0
+    
+    if n_frames >= 3 and sigma_clip_iters > 0:
+        for _ in range(sigma_clip_iters):
+            sum_inv_var = np.sum(inv_var, axis=0)
+            safe = sum_inv_var > 1e-10
+            weighted_mean = np.where(safe,
+                                     np.sum(np.where(valid, data_stack * inv_var, 0), axis=0) /
+                                     np.clip(sum_inv_var, 1e-10, None), 0)
+            residual = data_stack - weighted_mean[np.newaxis, :, :]
+            # Per-pixel weighted variance
+            n_valid = np.sum(valid, axis=0)
+            weighted_var = np.where((safe) & (n_valid > 1),
+                                    np.sum(np.where(valid, inv_var * residual**2, 0), axis=0) /
+                                    np.clip(sum_inv_var, 1e-10, None), 0)
+            weighted_std = np.sqrt(weighted_var)
+
+            # Baseline symmetric clipping around weighted mean.
+            outlier = valid & (np.abs(residual) > sigma_clip_thresh * weighted_std[np.newaxis, :, :])
+
+            # Robust clipping around per-pixel median using MAD.
+            # This catches single-frame cosmic/hot outliers even when mean/std
+            # are themselves biased by the outlier.
+            if robust_mad_clip:
+                med = np.nanmedian(np.where(valid, data_stack, np.nan), axis=0)
+                abs_dev = np.abs(data_stack - med[np.newaxis, :, :])
+                mad = np.nanmedian(np.where(valid, abs_dev, np.nan), axis=0)
+                robust_sigma = 1.4826 * mad
+
+                # Safety floor: avoid zero-threshold at very low scatter.
+                # Use expected noise scale from individual-frame noise maps.
+                exp_sigma = np.sqrt(np.where(np.any(valid, axis=0),
+                                             np.nanmedian(np.where(valid, var_stack, np.nan), axis=0),
+                                             0.0))
+                robust_sigma = np.maximum(robust_sigma, np.maximum(exp_sigma, 1e-6))
+
+                outlier_rob = valid & (abs_dev > robust_mad_sigma * robust_sigma[np.newaxis, :, :])
+                outlier = outlier | outlier_rob
+
+            new_valid = valid & ~outlier
+            new_inv_var = np.where(new_valid, 1.0 / var_stack, 0.0)
+            total_rejected += int(np.sum(valid & ~new_valid))
+            if np.array_equal(new_valid, valid):
+                break
+            valid = new_valid
+            inv_var = new_inv_var
+    
     sum_inv_var = np.sum(inv_var, axis=0)
     good = sum_inv_var > 1e-10
     
@@ -2364,6 +2717,12 @@ def coadd_aligned_frames(aligned_files, group_name, output_dir, is_incomplete, c
     hdul.writeto(coadd_path, overwrite=True)
     # Count coadds created
     STATS['coadds'] += 1
+
+    if verbose and n_frames >= 3:
+        kept = int(np.sum(valid))
+        total = int(np.sum(np.isfinite(data_stack) & np.isfinite(noise_stack) & (var_stack > 0)))
+        rej_frac = 100.0 * total_rejected / max(total, 1)
+        logging.info(f"    Coadd clipping: rejected {total_rejected} / {total} samples ({rej_frac:.2f}%), kept {kept}")
     
     return coadd_path
 
@@ -2444,6 +2803,22 @@ def process_catalog(cat_2mass, cat_vsx, config):
     vsx_tol = config['astrometry']['catalog']['vsx_match_arcsec']
     
     cat_2mass['variable'] = 0
+    
+    # Preserve star/galaxy separation columns from 2MASS
+    # ext_key: extended source association key (non-empty = likely galaxy/extended)
+    # gal_contam: galaxy contamination flag (0 = no contamination)
+    # ph_qual: photometric quality flag per band (A=best, E=worst; 'AAA' = good JHK)
+    # prox: distance to nearest 2MASS neighbor [arcsec] (large = isolated)
+    if 'ext_key' not in cat_2mass.columns:
+        cat_2mass['ext_key'] = ''
+    if 'gal_contam' not in cat_2mass.columns:
+        cat_2mass['gal_contam'] = 0
+    if 'ph_qual' not in cat_2mass.columns:
+        cat_2mass['ph_qual'] = 'UUU'
+    if 'prox' not in cat_2mass.columns:
+        cat_2mass['prox'] = 99.0
+    # Mark extended sources: ext_key is non-empty and non-null
+    cat_2mass['is_extended'] = cat_2mass['ext_key'].fillna('').astype(str).str.strip().ne('')
     
     if cat_vsx is not None and len(cat_vsx) > 0:
         # Match catalogs
@@ -2536,7 +2911,7 @@ def group_coadds_by_position(coadd_files, config, verbose=False):
     return groups
 
 def download_catalogs_for_groups(position_groups, config, catalog_dir, verbose=False):
-    """Download catalogs for each position group."""
+    """Download catalogs for each position group. Reuses cached files if present."""
     if verbose:
         logging.info("Downloading catalogs...")
     
@@ -2553,6 +2928,17 @@ def download_catalogs_for_groups(position_groups, config, catalog_dir, verbose=F
         if verbose:
             logging.info(f"  Position {i+1}: RA={ra:.4f}, DEC={dec:.4f}")
         
+        cat_filename = f"catalog_{i+1}_ra{ra:.4f}_dec{dec:.4f}.csv"
+        cat_path = os.path.join(catalog_dir, cat_filename)
+        
+        # Reuse cached catalog if it exists and has data
+        if os.path.isfile(cat_path) and os.path.getsize(cat_path) > 100:
+            if verbose:
+                logging.info(f"    Using cached catalog: {cat_filename}")
+            for coadd_file in group['files']:
+                catalog_map[coadd_file] = cat_path
+            continue
+        
         # Download 2MASS
         cat_2mass = download_catalog(ra, dec, radius_arcmin, '2mass', config)
         
@@ -2566,12 +2952,11 @@ def download_catalogs_for_groups(position_groups, config, catalog_dir, verbose=F
         # Process catalog
         cat_processed = process_catalog(cat_2mass, cat_vsx, config)
         
-        # Save catalog
-        cat_filename = f"catalog_{i+1}_ra{ra:.4f}_dec{dec:.4f}.csv"
-        cat_path = os.path.join(catalog_dir, cat_filename)
-        
-        # Save relevant columns
-        cols = ['RAJ2000', 'DEJ2000', 'H', 'J', 'K', 'eH', 'eJ', 'eK', 'variable']
+        # Save relevant columns (ext_key for star/galaxy separation, gal_contam for contamination flag)
+        cols = ['RAJ2000', 'DEJ2000', 'H', 'J', 'K', 'eH', 'eJ', 'eK',
+                'variable', 'ext_key', 'gal_contam', 'is_extended',
+                'ph_qual', 'prox']
+        cols = [c for c in cols if c in cat_processed.columns]
         cat_processed[cols].to_csv(cat_path, index=False)
         
         # Map catalog to files
@@ -2616,6 +3001,8 @@ def detect_sources(data, config, npix_min, threshold_sigma, return_rms_matrix=Fa
     fh = det_cfg.get('sep_fh', 2)
     n_iter = det_cfg.get('n_iter', 2)
     mask_scale = det_cfg.get('iter_mask_scale', 2.5)
+    deblend_nthresh = det_cfg.get('deblend_nthresh', 64)
+    deblend_cont = det_cfg.get('deblend_cont', 0.005)
     
     # Initialize mask with invalid pixels
     mask = np.zeros(data.shape, dtype=bool)
@@ -2645,7 +3032,9 @@ def detect_sources(data, config, npix_min, threshold_sigma, return_rms_matrix=Fa
             pass
         
         # Extract sources
-        objects = sep.extract(data_sub, threshold, minarea=npix_min)
+        objects = sep.extract(data_sub, threshold, minarea=npix_min,
+                              deblend_nthresh=deblend_nthresh,
+                              deblend_cont=deblend_cont)
         
         # Update mask with detected sources for next iteration (except last)
         if iteration < n_iter - 1 and len(objects) > 0:
@@ -2662,24 +3051,100 @@ def detect_sources(data, config, npix_min, threshold_sigma, return_rms_matrix=Fa
                     circ_mask = (x - cx)**2 + (y - cy)**2 <= radius**2
                     mask |= circ_mask
     
+    # Residual re-extraction: subtract detected source models and re-detect
+    # to find faint sources hidden under the wings of bright neighbors
+    if objects is not None and len(objects) > 0:
+        residual = data_sub.copy()
+        ny, nx = residual.shape
+        for obj in objects:
+            # Subtract each source as a 2D Gaussian matching SEP parameters
+            cx, cy = obj['x'], obj['y']
+            a_s, b_s = max(obj['a'], 0.5), max(obj['b'], 0.5)
+            theta = obj['theta']
+            peak = obj['peak']
+            r_cut = int(np.ceil(max(a_s, b_s) * 5))
+            x0, x1 = max(0, int(cx) - r_cut), min(nx, int(cx) + r_cut + 1)
+            y0, y1 = max(0, int(cy) - r_cut), min(ny, int(cy) + r_cut + 1)
+            yy, xx = np.mgrid[y0:y1, x0:x1]
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            dx = xx - cx
+            dy = yy - cy
+            xr = cos_t * dx + sin_t * dy
+            yr = -sin_t * dx + cos_t * dy
+            model = peak * np.exp(-0.5 * (xr**2 / a_s**2 + yr**2 / b_s**2))
+            residual[y0:y1, x0:x1] -= model
+        
+        # Re-extract on the residual image
+        try:
+            new_objects = sep.extract(residual, threshold, minarea=npix_min,
+                                      deblend_nthresh=deblend_nthresh,
+                                      deblend_cont=deblend_cont)
+            if len(new_objects) > 0:
+                # Keep only genuinely new detections (not near existing ones)
+                existing_xy = np.column_stack([objects['x'], objects['y']])
+                new_xy = np.column_stack([new_objects['x'], new_objects['y']])
+                tree = cKDTree(existing_xy)
+                dists, _ = tree.query(new_xy)
+                min_sep = max(2.0, np.median(np.sqrt(objects['a']**2 + objects['b']**2)) * 1.5)
+                novel = dists > min_sep
+                if np.any(novel):
+                    novel_objs = new_objects[novel]
+                    # Re-measure flux on original (un-subtracted) data_sub
+                    for i in range(len(novel_objs)):
+                        ox, oy = novel_objs['x'][i], novel_objs['y'][i]
+                        r_ap = max(novel_objs['a'][i], novel_objs['b'][i]) * 2.5
+                        flux_sum, _, _ = sep.sum_circle(data_sub, [ox], [oy], r_ap)
+                        novel_objs['flux'][i] = flux_sum[0]
+                        # Re-measure peak from original image
+                        px, py = int(round(ox)), int(round(oy))
+                        py0, py1 = max(0, py-1), min(ny, py+2)
+                        px0, px1 = max(0, px-1), min(nx, px+2)
+                        novel_objs['peak'][i] = np.max(data_sub[py0:py1, px0:px1])
+                    objects = rfn.stack_arrays([objects, novel_objs], usemask=False)
+        except Exception:
+            pass
+    
     # Create sources list (vectorized)
     sources = []
     if objects is not None and len(objects) > 0:
+        # Refine centroids using windowed algorithm (iterative Gaussian window)
+        # This is equivalent to SExtractor's XWIN_IMAGE/YWIN_IMAGE and is
+        # significantly more precise than isophotal centroids for undersampled PSFs.
+        # sig = geometric mean of semi-axes (proxy for FWHM/2.35)
+        x_iso = objects['x'].astype(np.float64)
+        y_iso = objects['y'].astype(np.float64)
+        sig = np.sqrt(objects['a'].astype(np.float64) * objects['b'].astype(np.float64))
+        sig = np.maximum(sig, 0.5)  # minimum 0.5 px (SEP default floor)
+        try:
+            x_win, y_win, win_flag = sep.winpos(data_sub, x_iso, y_iso, sig)
+            # Use windowed position only where it converged (flag == 0)
+            good = win_flag == 0
+            x_use = np.where(good, x_win, x_iso)
+            y_use = np.where(good, y_win, y_iso)
+        except Exception:
+            # Fallback to isophotal if winpos fails entirely
+            x_use = x_iso
+            y_use = y_iso
+        
         # Vectorized magnitude calculation
         fluxes = objects['flux'].astype(np.float64)
         valid_flux = fluxes > 0
         mags = np.full(len(fluxes), default_mag)
         mags[valid_flux] = -2.5 * np.log10(fluxes[valid_flux]) + inst_zp
         
-        # Build sources list (now with pre-computed mags)
+        # Build sources list with refined centroids
         sources = [
             {
-                'x': float(obj['x']),
-                'y': float(obj['y']),
+                'x': float(x_use[i]),
+                'y': float(y_use[i]),
                 'flux': float(obj['flux']),
                 'mag': float(mags[i]),
                 'a': float(obj['a']),
-                'b': float(obj['b'])
+                'b': float(obj['b']),
+                'theta': float(obj['theta']),
+                'npix': int(obj['npix']),
+                'flag': int(obj['flag']),
+                'peak': float(obj['peak'])
             }
             for i, obj in enumerate(objects)
         ]
@@ -2911,6 +3376,62 @@ def get_central_mask(positions, image_shape, central_fraction=0.90):
     return central_mask
 
 
+def get_stellar_mask(sources, config):
+    """Return mask selecting only point-source-like detections.
+    
+    Identifies the stellar locus from the population of detected sources
+    and rejects objects whose size or ellipticity deviate significantly.
+    Point sources share the same PSF, so their semi-axes cluster tightly;
+    galaxies, blends, and artifacts are outliers.
+    
+    Criteria:
+    1. SEP extraction flag == 0 (clean extraction, no blending/truncation)
+    2. Size (geometric mean of semi-axes sqrt(a*b)) within n_sigma of the
+       clipped median — rejects extended objects and cosmics/hot pixels
+    3. Ellipticity (1 - b/a) below a maximum threshold — rejects elongated
+       artifacts, diffraction spikes, and merging doubles
+    """
+    morph_cfg = config['photometry'].get('star_selection', {})
+    max_ellipticity = morph_cfg.get('max_ellipticity', 0.4)
+    size_sigma = morph_cfg.get('size_sigma', 3.0)
+    max_flag = morph_cfg.get('max_flag', 0)
+    
+    n = len(sources)
+    if n < 5:
+        return np.ones(n, dtype=bool)
+    
+    a_arr = np.array([s['a'] for s in sources])
+    b_arr = np.array([s['b'] for s in sources])
+    flags = np.array([s.get('flag', 0) for s in sources])
+    
+    # Geometric mean of semi-axes = proxy for PSF sigma
+    size = np.sqrt(a_arr * b_arr)
+    ellipticity = 1.0 - np.clip(b_arr / np.maximum(a_arr, 1e-6), 0, 1)
+    
+    # Flag filter: keep only cleanly-extracted sources
+    flag_ok = flags <= max_flag
+    
+    # Ellipticity filter
+    ell_ok = ellipticity <= max_ellipticity
+    
+    # Size filter: sigma-clipped median of the stellar locus
+    # Use only round, unflagged sources to define the locus
+    locus_mask = flag_ok & ell_ok
+    if np.sum(locus_mask) < 5:
+        locus_mask = np.ones(n, dtype=bool)
+    
+    locus_sizes = size[locus_mask]
+    med_size = np.median(locus_sizes)
+    mad_size = np.median(np.abs(locus_sizes - med_size))
+    sigma_size = 1.4826 * mad_size  # MAD → Gaussian σ
+    sigma_size = max(sigma_size, 0.1)  # floor to avoid zero-width locus
+    
+    size_ok = np.abs(size - med_size) < size_sigma * sigma_size
+    
+    stellar_mask = flag_ok & ell_ok & size_ok
+    return stellar_mask
+
+
 def aperture_photometry_with_noise(positions, data_sub, noise_matrix, aperture_radius):
     """Perform aperture photometry computing errors from noise matrix.
     
@@ -2940,143 +3461,80 @@ def aperture_photometry_with_noise(positions, data_sub, noise_matrix, aperture_r
     return fluxes, flux_errors
 
 
-def compute_limiting_magnitude(sources_data, target_error=0.33):
-    """Compute limiting magnitude by finding where mag_err = target_error.
+def compute_limiting_magnitude(zp, noise_map, aperture_radius, inst_zp=25.0,
+                               target_snr=3.0, central_fraction=0.8):
+    """Compute limiting magnitude from the image noise properties.
     
-    Uses the cumulative distribution of detected sources:
-    1. Sort sources by calibrated magnitude (bright to faint)
-    2. Bin sources by magnitude and compute median error per bin
-    3. Interpolate to find exact magnitude where error = target_error
+    Instead of extrapolating from detected sources (unreliable with few stars),
+    this method estimates the noise in a typical empty-sky aperture directly from
+    the noise map, then converts the flux at the target S/N to a calibrated
+    magnitude.
     
-    This approach is robust because:
-    - Binning averages out individual variations
-    - Median per bin is robust to outliers
-    - Linear interpolation gives precise crossing point
+    Algorithm:
+    1. Estimate the typical per-pixel noise from the central region of the
+       noise map (median, avoiding edges and masked pixels)
+    2. Compute the noise in a circular aperture: σ_aper = σ_pix × √(N_pix)
+       where N_pix = π × r²
+    3. The faintest detectable flux at target S/N: F_lim = target_snr × σ_aper
+    4. Convert to calibrated magnitude: mag_lim = (inst_zp - 2.5·log10(F_lim)) + zp
     
     Args:
-        sources_data: List of dicts with 'mag_cal', 'e_mag_cal', 'flag'
-        target_error: Target magnitude error (default 0.33 mag ≈ 3σ detection)
+        zp: Photometric zero point (calibrated - instrumental)
+        noise_map: 2D noise (RMS) map combining all noise sources
+                   (Poisson + read noise + sky subtraction + background estimation)
+        aperture_radius: Aperture radius in pixels
+        inst_zp: Instrumental zero point (default 25.0)
+        target_snr: Signal-to-noise ratio defining the limit (default 3.0 ≈ 0.36 mag error)
+        central_fraction: Fraction of image used for noise estimation (default 0.8)
     
     Returns:
-        mag_lim: Limiting magnitude where error = target_error, or 99.0 if failed
+        mag_lim: Limiting magnitude, or 99.0 if computation fails
     """
-    if not sources_data or len(sources_data) < 5:
+    if noise_map is None or zp is None:
         return 99.0
     
-    # Extract all sources with valid photometry (not just flag=0, to have more statistics)
-    all_sources = []
-    for src in sources_data:
-        mag = src.get('mag_cal', 99.0)
-        err = src.get('e_mag_cal', 99.0)
-        if np.isfinite(mag) and np.isfinite(err) and err > 0 and err < 2.0 and mag < 90:
-            all_sources.append((mag, err))
-    
-    if len(all_sources) < 5:
-        return 99.0
-    
-    # Sort by magnitude (bright to faint)
-    all_sources.sort(key=lambda x: x[0])
-    mags = np.array([s[0] for s in all_sources])
-    errs = np.array([s[1] for s in all_sources])
-    
-    # Create magnitude bins (0.5 mag width)
-    mag_min = np.floor(mags.min() * 2) / 2  # Round down to 0.5
-    mag_max = np.ceil(mags.max() * 2) / 2   # Round up to 0.5
-    bin_width = 0.5
-    
-    bin_edges = np.arange(mag_min, mag_max + bin_width, bin_width)
-    
-    if len(bin_edges) < 3:
-        # Not enough range, use direct interpolation on sorted data
-        # Find where error crosses target
-        for i in range(len(mags) - 1):
-            if errs[i] < target_error <= errs[i + 1]:
-                frac = (target_error - errs[i]) / (errs[i + 1] - errs[i])
-                return float(mags[i] + frac * (mags[i + 1] - mags[i]))
-        # Extrapolate if needed
-        if errs[-1] < target_error:
-            return float(mags[-1] + 0.5)
-        return float(mags[0])
-    
-    # Compute median error per bin
-    bin_centers = []
-    bin_median_errs = []
-    
-    for i in range(len(bin_edges) - 1):
-        mask = (mags >= bin_edges[i]) & (mags < bin_edges[i + 1])
-        if np.sum(mask) >= 2:  # At least 2 sources per bin
-            bin_centers.append((bin_edges[i] + bin_edges[i + 1]) / 2)
-            bin_median_errs.append(np.median(errs[mask]))
-    
-    if len(bin_centers) < 2:
-        # Fallback: use faintest detected
-        return float(mags[-1])
-    
-    bin_centers = np.array(bin_centers)
-    bin_median_errs = np.array(bin_median_errs)
-    
-    # Find crossing point where median error = target_error
-    for i in range(len(bin_centers) - 1):
-        err_lo = bin_median_errs[i]
-        err_hi = bin_median_errs[i + 1]
-        mag_lo = bin_centers[i]
-        mag_hi = bin_centers[i + 1]
+    try:
+        ny, nx = noise_map.shape
         
-        # Check if target_error is between these two bins
-        if err_lo < target_error <= err_hi:
-            # Linear interpolation
-            frac = (target_error - err_lo) / (err_hi - err_lo)
-            mag_lim = mag_lo + frac * (mag_hi - mag_lo)
-            return float(mag_lim)
-        elif err_hi < target_error <= err_lo:
-            # Decreasing (unusual but handle it)
-            frac = (target_error - err_hi) / (err_lo - err_hi)
-            mag_lim = mag_hi + frac * (mag_lo - mag_hi)
-            return float(mag_lim)
-    
-    # If we reach here, target_error is outside the range of binned errors
-    # Extrapolate using last few bins
-    if bin_median_errs[-1] < target_error:
-        # Need to extrapolate to fainter magnitudes
-        # Fit log(err) vs mag on last few bins
-        n_fit = min(4, len(bin_centers))
-        try:
-            coeffs = np.polyfit(bin_centers[-n_fit:], np.log10(bin_median_errs[-n_fit:]), 1)
-            slope, intercept = coeffs
-            if slope > 0:
-                # log10(target_error) = intercept + slope * mag_lim
-                mag_lim = (np.log10(target_error) - intercept) / slope
-                # Sanity check: should be fainter than last bin but not crazy
-                if mag_lim > bin_centers[-1] and mag_lim < bin_centers[-1] + 3.0:
-                    return float(mag_lim)
-        except:
-            pass
-        # Fallback
-        return float(mags[-1] + 0.5)
-    
-    if bin_median_errs[0] > target_error:
-        # Even brightest bin has error > target (unusual)
-        return float(bin_centers[0])
-    
-    # Fallback
-    return float(mags[-1])
+        # Use central region to avoid noisy edges / vignetted corners
+        margin_y = int(ny * (1 - central_fraction) / 2)
+        margin_x = int(nx * (1 - central_fraction) / 2)
+        central = noise_map[margin_y:ny - margin_y, margin_x:nx - margin_x]
+        
+        # Median per-pixel noise (robust to outliers / source residuals)
+        sigma_pixel = np.nanmedian(central)
+        
+        if sigma_pixel <= 0 or not np.isfinite(sigma_pixel):
+            return 99.0
+        
+        # Noise in a circular aperture (assuming uncorrelated pixels)
+        n_pix = np.pi * aperture_radius ** 2
+        sigma_aperture = sigma_pixel * np.sqrt(n_pix)
+        
+        # Flux at the detection limit
+        f_lim = target_snr * sigma_aperture
+        
+        if f_lim <= 0:
+            return 99.0
+        
+        # Calibrated limiting magnitude
+        mag_lim = inst_zp - 2.5 * np.log10(f_lim) + zp
+        
+        return float(mag_lim)
+        
+    except Exception:
+        return 99.0
 
 
 def match_detections_to_catalog(det_positions, cat_positions, tolerance):
-    """Match detections to catalog positions.
+    """Match detections to catalog by nearest neighbour within tolerance.
     
-    Returns:
-    --------
-    matched_det_idx : indices of matched detections
-    matched_cat_idx : indices of matched catalog sources
+    Ensures uniqueness: each catalog source is matched to at most one detection.
     """
     tree = cKDTree(cat_positions)
     distances, indices = tree.query(det_positions, k=1)
-    
-    # Keep only within tolerance
     valid_mask = distances < tolerance
     
-    # Ensure uniqueness (one catalog source per detection)
     matched_pairs = {}
     for det_idx in np.where(valid_mask)[0]:
         cat_idx = indices[det_idx]
@@ -3084,17 +3542,28 @@ def match_detections_to_catalog(det_positions, cat_positions, tolerance):
         if cat_idx not in matched_pairs or dist < matched_pairs[cat_idx][1]:
             matched_pairs[cat_idx] = (det_idx, dist)
     
-    # Extract unique pairs
     matched_det_idx = [pair[0] for pair in matched_pairs.values()]
     matched_cat_idx = list(matched_pairs.keys())
-    
     return np.array(matched_det_idx), np.array(matched_cat_idx)
 
 
-def fit_zeropoint_iterative(mag_inst, mag_cat, mag_inst_err, mag_cat_err, 
-                            sigma_clip=3.0, target_rms=None, min_stars=3, verbose=False):
-    """Fit zeropoint with iterative outlier rejection until RMS < target_rms or min_stars left."""
-    mask = np.ones(len(mag_inst), dtype=bool)
+def fit_zeropoint(mag_inst, mag_cat, mag_inst_err, mag_cat_err,
+                  target_rms=None, min_stars=3, verbose=False):
+    """Fit zeropoint with iterative worst-outlier rejection.
+    
+    m_cat = m_inst + ZP  (weighted mean).
+    
+    Removes one worst outlier per iteration until target_rms is reached
+    or min_stars remain.
+    
+    Returns
+    -------
+    zp, zp_err, rms, mask, n_used, n_total
+    Returns None-filled tuple on failure.
+    """
+    n_total = len(mag_inst)
+    mask = np.ones(n_total, dtype=bool)
+    
     iteration = 0
     while True:
         mi = mag_inst[mask]
@@ -3102,32 +3571,30 @@ def fit_zeropoint_iterative(mag_inst, mag_cat, mag_inst_err, mag_cat_err,
         ei = mag_inst_err[mask]
         ec = mag_cat_err[mask]
         err_combined = np.sqrt(ec**2 + ei**2)
-        zps = mc - mi
         weights = 1.0 / err_combined**2
-        zp_mean = np.sum(zps * weights) / np.sum(weights)
+        
+        zps = mc - mi
+        zp = np.sum(zps * weights) / np.sum(weights)
         zp_err = 1.0 / np.sqrt(np.sum(weights))
-        residuals = mc - (mi + zp_mean)
+        residuals = mc - (mi + zp)
+        
         rms = np.sqrt(np.mean(residuals**2))
         
         if verbose:
             logging.info(f"      Iter {iteration}: N={np.sum(mask)}, RMS={rms:.3f}")
         
         if target_rms is not None and rms < target_rms:
-            if verbose:
-                logging.info(f"      Target RMS {target_rms:.3f} reached")
             break
         if np.sum(mask) <= min_stars:
-            if verbose:
-                logging.info(f"      Minimum stars ({min_stars}) reached")
             break
-        # Remove only the worst outlier (largest |residual|)
+        
         worst_idx = np.argmax(np.abs(residuals))
         mask_indices = np.where(mask)[0]
         mask[mask_indices[worst_idx]] = False
         iteration += 1
-    n_used = np.sum(mask)
-    n_total = len(mask)
-    return zp_mean, zp_err, rms, mask, n_used, n_total
+    
+    n_used = int(np.sum(mask))
+    return zp, zp_err, rms, mask, n_used, n_total
 
 
 def generate_photometry_plot(mag_inst_all, mag_cat_all, mag_inst_err_all, 
@@ -3209,16 +3676,154 @@ def generate_photometry_plot(mag_inst_all, mag_cat_all, mag_inst_err_all,
     plt.close(fig)
 
 
+def generate_detection_map(data, sources, aperture_radius, filename, output_path, config,
+                           targets=None, wcs=None, sources_data=None, mag_lim=None,
+                           pixel_scale=None):
+    """Save a PNG showing the image with all detected sources circled.
+    
+    If targets are provided (from -f file), draws an X at each target position
+    with an error circle. If a detected source falls within the error radius,
+    highlights it in green and labels it with its calibrated magnitude.
+    Otherwise labels it with the limiting magnitude.
+    
+    Parameters are read from config['detection_map'].
+    """
+    dm_cfg = config.get('detection_map', {})
+    central_fraction = dm_cfg.get('central_fraction', 0.8)
+    pct_lo = dm_cfg.get('percentile_low', 5)
+    pct_hi = dm_cfg.get('percentile_high', 95)
+    cmap = dm_cfg.get('colormap', 'Greys')
+    dpi = dm_cfg.get('dpi', 200)
+    figsize = dm_cfg.get('figsize', [8, 8])
+    circ_color = dm_cfg.get('circle_color', 'red')
+    circ_lw = dm_cfg.get('circle_linewidth', 0.6)
+    circ_alpha = dm_cfg.get('circle_alpha', 0.8)
+    title_fs = dm_cfg.get('title_fontsize', 10)
+
+    ny, nx = data.shape
+    margin = int((1.0 - central_fraction) / 2.0 * ny)
+    central = data[margin:ny - margin, margin:nx - margin]
+    finite = central[np.isfinite(central)]
+    if len(finite) == 0:
+        return
+    vmin, vmax = np.percentile(finite, [pct_lo, pct_hi])
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.imshow(data, origin='lower', cmap=cmap, vmin=vmin, vmax=vmax,
+              interpolation='nearest', aspect='equal')
+
+    for s in sources:
+        circ = plt.Circle((s['x'], s['y']), aperture_radius,
+                           edgecolor=circ_color, facecolor='none',
+                           linewidth=circ_lw, alpha=circ_alpha)
+        ax.add_patch(circ)
+
+    ax.set_title(f"{filename}  —  {len(sources)} detections", fontsize=title_fs)
+    ax.set_xlim(-0.5, nx - 0.5)
+    ax.set_ylim(-0.5, ny - 0.5)
+    ax.tick_params(labelsize=8)
+    
+    # Overlay target positions from -f file
+    if targets and wcs is not None and pixel_scale:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        for tgt in targets:
+            # Convert target RA/Dec to pixel coordinates
+            try:
+                tgt_x, tgt_y = wcs.all_world2pix(tgt['ra_deg'], tgt['dec_deg'], 0)
+            except Exception:
+                continue
+            
+            # Skip if outside image
+            if tgt_x < -10 or tgt_x > nx + 10 or tgt_y < -10 or tgt_y > ny + 10:
+                continue
+            
+            # Error circle radius in pixels
+            r_px = tgt['radius_arcsec'] / pixel_scale
+            
+            # Draw X marker at target position
+            marker_size = max(r_px * 0.6, 4)
+            ax.plot(tgt_x, tgt_y, 'x', color='cyan', markersize=marker_size,
+                    markeredgewidth=1.5, zorder=10)
+            
+            # Draw error circle
+            err_circ = plt.Circle((tgt_x, tgt_y), r_px,
+                                   edgecolor='cyan', facecolor='none',
+                                   linewidth=1.2, linestyle='--', alpha=0.9, zorder=10)
+            ax.add_patch(err_circ)
+            
+            # Search for a detected source within error radius
+            matched = False
+            forced = False
+            if sources_data:
+                best_dist = np.inf
+                best_mag = None
+                best_mag_err = None
+                best_x, best_y = None, None
+                best_flag = None
+                
+                for sd in sources_data:
+                    tgt_coord = SkyCoord(tgt['ra_deg'], tgt['dec_deg'], unit=u.deg)
+                    src_coord = SkyCoord(sd['ra'], sd['dec'], unit=u.deg)
+                    sep_arcsec = tgt_coord.separation(src_coord).arcsec
+                    
+                    if sep_arcsec <= tgt['radius_arcsec'] and sep_arcsec < best_dist:
+                        best_dist = sep_arcsec
+                        best_mag = sd['mag_cal']
+                        best_mag_err = sd.get('e_mag_cal', 99.0)
+                        best_x, best_y = sd['x'], sd['y']
+                        best_flag = sd.get('flag', 0)
+                
+                if best_mag is not None and np.isfinite(best_mag) and best_mag < 90:
+                    if best_flag == 4:
+                        # Forced photometry result
+                        forced = True
+                        max_forced_err = config['photometry'].get('max_forced_mag_err', 0.33)
+                        if best_mag_err < max_forced_err:
+                            label = f"F:{best_mag:.2f}±{best_mag_err:.2f}"
+                            color = 'yellow'
+                        else:
+                            label = f">{mag_lim:.2f}" if mag_lim and mag_lim < 90 else "N/D"
+                            color = 'orange'
+                        # Draw forced aperture circle
+                        forced_circ = plt.Circle((best_x, best_y), aperture_radius,
+                                                  edgecolor='yellow', facecolor='none',
+                                                  linewidth=1.2, linestyle=':', zorder=11)
+                        ax.add_patch(forced_circ)
+                    else:
+                        matched = True
+                        # Highlight matched source in green
+                        match_circ = plt.Circle((best_x, best_y), aperture_radius,
+                                                edgecolor='lime', facecolor='none',
+                                                linewidth=1.5, zorder=11)
+                        ax.add_patch(match_circ)
+                        label = f"{best_mag:.2f}"
+                        color = 'lime'
+            
+            if not matched and not forced:
+                label = f">{mag_lim:.2f}" if mag_lim and mag_lim < 90 else "N/D"
+                color = 'orange'
+            
+            ax.annotate(label, (tgt_x, tgt_y), textcoords='offset points',
+                        xytext=(8, 8), fontsize=7, color=color, fontweight='bold',
+                        zorder=12)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi, bbox_inches='tight')
+    plt.close(fig)
+
+
 def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err, 
                            rms, n_stars, aperture_radius, filter_name, filename,
                            config, mag_lim=None, threshold_sigma=None, min_pixels=None, n_total=None,
-                           date_obs=None, exptime=None, object_name=None):
+                           date_obs=None, exptime=None, object_name=None,
+                           is_coadd=False, ncoadd=None):
     """Save photometry catalog as .txt file with calibration info in header.
     
     Columns: ra dec x y mag_inst e_mag_inst mag_cat e_mag_cat mag_cal e_mag_cal flag
     -99 -99 for sources not in catalog
     Flag: 0=isolated+central, 1=crowded, 2=border, 3=crowded+border
-    Aperture is noted in header comment only (fixed for all sources)
     """
     # Calculate quality using helper functions
     rms_quality = calculate_rms_quality(rms, config)
@@ -3232,6 +3837,10 @@ def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err,
             f.write(f"# DATE-OBS: {date_obs}\n")
         if exptime is not None:
             f.write(f"# EXPTIME: {exptime} s\n")
+        if is_coadd:
+            f.write(f"# Image type: COADD ({ncoadd} frames)\n")
+        else:
+            f.write(f"# Image type: SINGLE\n")
         f.write(f"# Filter: {filter_name}\n")
         f.write(f"# Zeropoint: {zeropoint:.4f} +/- {zeropoint_err:.4f} mag\n")
         f.write(f"# RMS residuals: {rms:.4f} mag\n")
@@ -3250,7 +3859,7 @@ def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err,
         f.write("#\n")
         f.write("# Columns: ra dec x y mag_inst e_mag_inst mag_cat e_mag_cat mag_cal e_mag_cal flag\n")
         f.write("# Note: mag_cat and e_mag_cat are -99 -99 for sources not matched to 2MASS catalog\n")
-        f.write("# Flag: 0=isolated+central (best), 1=crowded, 2=border, 3=crowded+border\n")
+        f.write("# Flag: 0=isolated+central (best), 1=crowded, 2=border, 3=crowded+border, 4=forced\n")
         f.write("#\n")
         
         # Write data
@@ -3264,11 +3873,12 @@ def save_photometry_catalog(output_path, sources_data, zeropoint, zeropoint_err,
             f.write(line)
 
 
-def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose=False):
+def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose=False, targets=None):
     """Perform photometric calibration on an astrometrically calibrated FITS file.
     
-    Uses per-source optimal aperture for calibration stars, then interpolates
-    aperture for all other sources based on instrumental magnitude.
+    Uses a single fixed aperture radius (from config) for all sources.
+    Calibration stars are filtered to keep only isolated, stellar, non-variable
+    sources with good 2MASS photometric quality.
     
     Parameters:
     -----------
@@ -3330,6 +3940,14 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
     filename = os.path.basename(fits_path)
     exptime = header.get('EXPTIME', 0.0)
     
+    # Determine if this is a coadd or single frame
+    dithid = header.get('DITHID', -1)
+    pstatsub = header.get('PSTATSUB', -1)
+    dithid_coadd = config['fits_markers']['dithid_coadd']
+    pstatsub_coadd = config['fits_markers']['pstatsub_coadd']
+    is_coadd = (dithid == dithid_coadd) or (pstatsub == pstatsub_coadd)
+    ncoadd = header.get('NCOADD', None)
+    
     # Check if filter should be calibrated
     calibrate_filters = phot_cfg.get('calibrate_filters', ['J', 'H', 'K'])
     if filter_name not in calibrate_filters:
@@ -3364,28 +3982,80 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
     
     isolation_mask = get_isolation_mask(positions, min_isolation)
     central_mask = get_central_mask(positions, data.shape, central_fraction)
-    calib_mask = isolation_mask & central_mask
+    stellar_mask = get_stellar_mask(sources, config)
+    calib_mask = isolation_mask & central_mask & stellar_mask
     
     n_calib_sources = np.sum(calib_mask)
+    n_stellar = np.sum(stellar_mask)
     if verbose:
-        logging.info(f"    Detected {len(sources)} sources, {n_calib_sources} isolated+central for calibration")
+        logging.info(f"    Detected {len(sources)} sources, "
+                     f"{n_stellar} stellar, "
+                     f"{n_calib_sources} stellar+isolated+central for calibration")
     
     if n_calib_sources < phot_cfg['min_calibration_stars']:
         if verbose:
             logging.warning(f"    Too few isolated+central sources: {n_calib_sources}")
         return False, None
     
-    # Load catalog and filter by band and variable stars
+    # Load catalog and filter by band/variability/star-likeness
     catalog_df = pd.read_csv(catalog_path)
     default_mag = config['astrometry']['catalog']['default_mag']
-    
-    # Filter: has valid magnitude in this band and not variable
-    valid_cat = (catalog_df[filter_name] != default_mag) & (catalog_df['variable'] == 0)
+    min_cal_stars = phot_cfg['min_calibration_stars']
+
+    # Base: valid magnitude in this band + non-variable.
+    # Keep numeric conversion robust to malformed strings in catalog dumps.
+    mag_vals = pd.to_numeric(catalog_df[filter_name], errors='coerce') if filter_name in catalog_df.columns else np.nan
+    var_vals = pd.to_numeric(catalog_df.get('variable', 0), errors='coerce').fillna(0).astype(int)
+    base_mask = np.isfinite(mag_vals) & (mag_vals != default_mag) & (var_vals == 0)
+
+    # Galaxy/extended-source rejection mask from 2MASS metadata when available.
+    non_extended_mask = np.ones(len(catalog_df), dtype=bool)
+    if 'is_extended' in catalog_df.columns:
+        non_extended_mask &= ~catalog_df['is_extended'].astype(bool).values
+    elif 'ext_key' in catalog_df.columns:
+        non_extended_mask &= (catalog_df['ext_key'].fillna('').astype(str).str.strip() == '').values
+    if 'gal_contam' in catalog_df.columns:
+        non_extended_mask &= (pd.to_numeric(catalog_df['gal_contam'], errors='coerce').fillna(0).astype(int) == 0).values
+
+    # 2MASS quality mask in the selected band (A/B preferred for calibration).
+    quality_mask = np.ones(len(catalog_df), dtype=bool)
+    band_idx = {'J': 0, 'H': 1, 'K': 2}.get(filter_name, None)
+    if ('ph_qual' in catalog_df.columns) and (band_idx is not None):
+        pq = catalog_df['ph_qual'].fillna('UUU').astype(str)
+        quality_mask &= pq.str[band_idx].isin(['A', 'B']).values
+
+    # 2MASS neighbor isolation (avoid blended references in catalog itself).
+    isolation2m_mask = np.ones(len(catalog_df), dtype=bool)
+    if 'prox' in catalog_df.columns:
+        min_prox_arcsec = phot_cfg.get('min_isolation_dist', 6.0) * config['detector']['pixel_scale']
+        prox = pd.to_numeric(catalog_df['prox'], errors='coerce').fillna(0.0)
+        isolation2m_mask &= (prox > min_prox_arcsec).values
+
+    # Adaptive strategy: use the strictest star-only mask that still leaves
+    # enough calibrators. This keeps calibration robust while avoiding hard
+    # failures when some 2MASS quality columns are sparse/missing.
+    valid_strict = base_mask & non_extended_mask & quality_mask & isolation2m_mask
+    valid_no_iso = base_mask & non_extended_mask & quality_mask
+    valid_no_qual = base_mask & non_extended_mask
+    valid_minimal = base_mask
+
+    strategy_name = 'strict'
+    valid_cat = valid_strict
+    if np.sum(valid_cat) < min_cal_stars:
+        valid_cat = valid_no_iso
+        strategy_name = 'no_2mass_isolation'
+    if np.sum(valid_cat) < min_cal_stars:
+        valid_cat = valid_no_qual
+        strategy_name = 'no_ph_qual'
+    if np.sum(valid_cat) < min_cal_stars:
+        valid_cat = valid_minimal
+        strategy_name = 'minimal_non_variable'
+
     catalog_filtered = catalog_df[valid_cat].copy()
     
     if len(catalog_filtered) < phot_cfg['min_calibration_stars']:
         if verbose:
-            logging.warning(f"    Too few non-variable catalog sources: {len(catalog_filtered)}")
+            logging.warning(f"    Too few non-variable stellar catalog sources: {len(catalog_filtered)}")
         return False, None
     
     # Convert catalog to pixel coordinates
@@ -3401,13 +4071,12 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
     catalog_filtered = catalog_filtered[in_image].reset_index(drop=True)
     
     if verbose:
-        logging.info(f"    Catalog: {len(catalog_filtered)} non-variable sources in image")
+        logging.info(f"    Catalog: {len(catalog_filtered)} stellar candidates in image (strategy={strategy_name})")
     
     # Config parameters
     fixed_aperture = phot_cfg.get('aperture_radius', 3.0)
     match_tolerance = phot_cfg.get('match_tolerance', 2.0)
     default_cat_err = config['astrometry']['catalog'].get('default_error', 0.4)
-    sigma_clip_val = phot_cfg.get('sigma_clip', 3.0)
     inst_zp = config['detection'].get('instrumental_zeropoint', 25.0)
     max_inst_err = phot_cfg.get('max_inst_mag_err', 0.2)
     
@@ -3433,7 +4102,7 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         return False, None
     
     # =========================================================================
-    # STEP 1: Find optimal aperture for each calibration star
+    # STEP 1: Prepare calibration star data
     # =========================================================================
     
     # Indices of calibration stars (matched + isolated + central)
@@ -3455,75 +4124,58 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
                              mce_calib_all, default_cat_err)
     
     # =========================================================================
-    # STEP 2: Measure calibration stars with fixed aperture
+    # STEP 2: Fixed-aperture photometry
     # =========================================================================
     
-    # Measure calibration stars using combined noise (FITS + SEP bkg)
-    calib_positions = positions[calib_det_indices]
-    calib_fluxes, calib_flux_errors = aperture_photometry_with_noise(
-        calib_positions, data_sub, photometry_noise, fixed_aperture
-    )
+    fixed_aperture = phot_cfg.get('aperture_radius', 2.5)
+    target_rms = phot_cfg.get('target_rms', None)
     
-    # Calculate instrumental magnitudes
-    calib_mag_inst = np.full(n_calib, 99.0)
-    calib_mag_err = np.full(n_calib, 99.0)
-    valid_flux = calib_fluxes > 0
-    calib_mag_inst[valid_flux] = inst_zp - 2.5 * np.log10(calib_fluxes[valid_flux])
-    calib_mag_err[valid_flux] = 2.5 / np.log(10) * calib_flux_errors[valid_flux] / calib_fluxes[valid_flux]
+    # Measure all sources at the fixed aperture
+    f_opt, fe_opt = aperture_photometry_with_noise(positions, data_sub, photometry_noise, fixed_aperture)
     
-    # Filter out sources with too high error
-    valid_calib = (calib_mag_inst < 50) & (mc_calib_all < 50) & (calib_mag_err < max_inst_err)
+    # Instrumental magnitudes
+    final_mag_inst = np.full(len(sources), 99.0)
+    final_mag_err = np.full(len(sources), 99.0)
+    valid_all = f_opt > 0
+    final_mag_inst[valid_all] = inst_zp - 2.5 * np.log10(f_opt[valid_all])
+    final_mag_err[valid_all] = 2.5 / np.log(10) * fe_opt[valid_all] / f_opt[valid_all]
+    
+    # Fit ZP with calibration stars
+    cmi_opt = final_mag_inst[calib_det_indices]
+    cmie_opt = final_mag_err[calib_det_indices]
+    valid_calib = (cmi_opt < 50) & (mc_calib_all < 50) & (cmie_opt < max_inst_err)
     
     if np.sum(valid_calib) < phot_cfg['min_calibration_stars']:
         if verbose:
-            logging.warning(f"    Too few valid calibration stars after error cut: {np.sum(valid_calib)}")
+            logging.warning(f"    Too few valid calibration stars at r={fixed_aperture:.1f} px")
         return False, None
     
-    # =========================================================================
-    # STEP 3: Fit zeropoint
-    # =========================================================================
+    zp, zp_err, rms, final_mask, n_used, n_total = fit_zeropoint(
+        cmi_opt[valid_calib], mc_calib_all[valid_calib],
+        cmie_opt[valid_calib], mce_calib_all[valid_calib],
+        target_rms=target_rms,
+        min_stars=phot_cfg['min_calibration_stars'], verbose=False
+    )
     
-    mi_for_zp = calib_mag_inst[valid_calib]
-    mei_for_zp = calib_mag_err[valid_calib]
+    mi_for_zp = cmi_opt[valid_calib]
+    mei_for_zp = cmie_opt[valid_calib]
     mc_for_zp = mc_calib_all[valid_calib]
     mce_for_zp = mce_calib_all[valid_calib]
     
-    target_rms = phot_cfg.get('target_rms', None)
-    zp, zp_err, rms, final_mask, n_used, n_total = fit_zeropoint_iterative(
-        mi_for_zp, mc_for_zp, mei_for_zp, mce_for_zp,
-        sigma_clip=sigma_clip_val, target_rms=target_rms, 
-        min_stars=phot_cfg['min_calibration_stars'], verbose=verbose
-    )
-    
-    if n_used < phot_cfg['min_calibration_stars']:
-        if verbose:
-            logging.warning(f"    Not enough stars after sigma clipping: {n_used}")
-        return False, None
-    
     if verbose:
-        logging.info(f"    ZP={zp:.3f}±{zp_err:.3f}, RMS={rms:.3f}, {n_used} stars, aperture={fixed_aperture:.1f} px")
+        logging.info(f"    Aperture: r={fixed_aperture:.2f} px")
+        logging.info(f"    ZP={zp:.3f}±{zp_err:.3f}, RMS={rms:.3f}, "
+                     f"{n_used} stars, r={fixed_aperture:.1f}px")
     
     # =========================================================================
-    # STEP 4: Measure all sources with fixed aperture
+    # STEP 3: Apply zeropoint to get calibrated magnitudes
     # =========================================================================
     
-    # Measure all sources using combined noise (FITS + SEP bkg)
-    all_fluxes, all_flux_errors = aperture_photometry_with_noise(
-        positions, data_sub, photometry_noise, fixed_aperture
-    )
-    
-    final_mag_inst = np.full(len(sources), 99.0)
-    final_mag_err = np.full(len(sources), 99.0)
-    valid_all = all_fluxes > 0
-    final_mag_inst[valid_all] = inst_zp - 2.5 * np.log10(all_fluxes[valid_all])
-    final_mag_err[valid_all] = 2.5 / np.log(10) * all_flux_errors[valid_all] / all_fluxes[valid_all]
-    
-    # Apply zeropoint to get calibrated magnitudes
     mag_cal = final_mag_inst + zp
     mag_cal_err = final_mag_err
     
     # =========================================================================
-    # STEP 5: Generate calibration plot
+    # STEP 4: Generate calibration plot
     # =========================================================================
     
     plot_path = os.path.join(output_dir, filename.replace('.fits', '_photcal.png'))
@@ -3536,7 +4188,7 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         logging.info(f"    Saved calibration plot: {os.path.basename(plot_path)}")
     
     # =========================================================================
-    # STEP 6: Build full source catalog with flags
+    # STEP 5: Build full source catalog with flags
     # =========================================================================
     
     # Convert pixel to world coordinates for all sources
@@ -3586,12 +4238,118 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         
         sources_data.append(src)
     
-    # Compute limiting magnitude from mag error vs mag relation
-    # Extrapolates to mag_err = 0.33 (3σ detection threshold)
-    mag_lim = compute_limiting_magnitude(sources_data, target_error=0.33)
+    # Compute limiting magnitude from image noise properties
+    # Uses the noise map + ZP to estimate the faintest detectable source at S/N=3
+    mag_lim = compute_limiting_magnitude(
+        zp, photometry_noise, fixed_aperture,
+        inst_zp=inst_zp, target_snr=3.0
+    )
     
     if verbose:
-        logging.info(f"    Limiting magnitude (mag_err=0.33): {mag_lim:.2f} mag")
+        logging.info(f"    Limiting magnitude (S/N=3): {mag_lim:.2f} mag")
+    
+    # =========================================================================
+    # STEP 5b: Forced photometry at target positions (-f flag)
+    # =========================================================================
+    # For each target from the -f file, if no detected source falls within the
+    # error radius, perform aperture photometry at the exact target position.
+    # This gives a measurement (or meaningful upper limit) even when the source
+    # is too faint for blind detection.
+    forced_phot_results = []
+    if targets and wcs is not None:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        
+        max_forced_err = phot_cfg.get('max_forced_mag_err', 0.33)
+        
+        for tgt in targets:
+            try:
+                tgt_x, tgt_y = wcs.all_world2pix(tgt['ra_deg'], tgt['dec_deg'], 0)
+            except Exception:
+                continue
+            
+            # Skip if outside image
+            if tgt_x < 0 or tgt_x >= nx or tgt_y < 0 or tgt_y >= ny:
+                continue
+            
+            # Check if there's already a detected source within the error radius
+            already_detected = False
+            tgt_coord = SkyCoord(tgt['ra_deg'], tgt['dec_deg'], unit=u.deg)
+            for sd in sources_data:
+                src_coord = SkyCoord(sd['ra'], sd['dec'], unit=u.deg)
+                if tgt_coord.separation(src_coord).arcsec <= tgt['radius_arcsec']:
+                    already_detected = True
+                    break
+            
+            if already_detected:
+                continue
+            
+            # Forced aperture photometry at the exact target position
+            tgt_pos = np.array([[tgt_x, tgt_y]])
+            f_forced, fe_forced = aperture_photometry_with_noise(
+                tgt_pos, data_sub, photometry_noise, fixed_aperture
+            )
+            
+            flux_val = f_forced[0]
+            flux_err = fe_forced[0]
+            
+            # Compute instrumental and calibrated magnitudes
+            if flux_val > 0 and np.isfinite(flux_val):
+                mag_inst_forced = inst_zp - 2.5 * np.log10(flux_val)
+                mag_err_forced = 2.5 / np.log(10) * flux_err / flux_val
+                mag_cal_forced = mag_inst_forced + zp
+            else:
+                # Negative or zero flux — no meaningful measurement possible.
+                # Skip this target (the epoch will appear as a regular
+                # non-detection / upper limit in the notebook).
+                if verbose:
+                    logging.info(f"    Forced photometry at ({tgt['ra_deg']:.5f}, "
+                                 f"{tgt['dec_deg']:.5f}): no flux (skipped)")
+                continue
+            
+            forced_src = {
+                'ra': tgt['ra_deg'],
+                'dec': tgt['dec_deg'],
+                'x': tgt_x,
+                'y': tgt_y,
+                'mag_inst': mag_inst_forced,
+                'e_mag_inst': mag_err_forced,
+                'mag_cat': -99.0,
+                'e_mag_cat': -99.0,
+                'mag_cal': mag_cal_forced,
+                'e_mag_cal': mag_err_forced,
+                'aperture': fixed_aperture,
+                'flag': 4  # forced photometry
+            }
+            
+            sources_data.append(forced_src)
+            forced_phot_results.append(forced_src)
+            
+            if verbose:
+                if mag_err_forced < max_forced_err and mag_cal_forced < 90:
+                    logging.info(f"    Forced photometry at ({tgt['ra_deg']:.5f}, "
+                                 f"{tgt['dec_deg']:.5f}): {mag_cal_forced:.3f} ± "
+                                 f"{mag_err_forced:.3f} mag")
+                else:
+                    logging.info(f"    Forced photometry at ({tgt['ra_deg']:.5f}, "
+                                 f"{tgt['dec_deg']:.5f}): non-detection "
+                                 f"(err={mag_err_forced:.3f})")
+        
+        if verbose and forced_phot_results:
+            n_good = sum(1 for fp in forced_phot_results 
+                         if fp['e_mag_cal'] < max_forced_err and fp['mag_cal'] < 90)
+            logging.info(f"    Forced photometry: {n_good}/{len(forced_phot_results)} "
+                         f"targets with error < {max_forced_err} mag")
+    
+    # Generate detection map (all sources circled, with target overlay if -f given)
+    if config.get('detection_map', {}).get('enabled', True):
+        det_map_path = os.path.join(output_dir, filename.replace('.fits', '_detections.png'))
+        pixel_scale = config['detector'].get('pixel_scale', 1.221)
+        generate_detection_map(data_sub, sources, fixed_aperture, filename, det_map_path, config,
+                               targets=targets, wcs=wcs, sources_data=sources_data,
+                               mag_lim=mag_lim, pixel_scale=pixel_scale)
+        if verbose:
+            logging.info(f"    Saved detection map: {os.path.basename(det_map_path)}")
     
     # Save photometry catalog with all parameters
     catalog_txt_path = os.path.join(output_dir, filename.replace('.fits', '_photometry.txt'))
@@ -3605,7 +4363,9 @@ def photometric_calibration(fits_path, catalog_path, config, output_dir, verbose
         n_total=n_total,
         date_obs=header.get('DATE-OBS'),
         exptime=header.get('EXPTIME'),
-        object_name=header.get('OBJECT', None)
+        object_name=header.get('OBJECT', None),
+        is_coadd=is_coadd,
+        ncoadd=ncoadd
     )
     
     if verbose:
@@ -3753,9 +4513,10 @@ def save_with_astrometry(file_path, wcs, output_dir, config):
         primary_hdu = fits.PrimaryHDU(data, header=header)
         hdu_list = [primary_hdu]
         
-        # Preserve NOISE extension if present
-        if len(hdul) > 1 and hdul[1].name == 'NOISE':
-            hdu_list.append(hdul[1].copy())
+        # Preserve image extensions (NOISE, WEIGHT, etc.) for diagnostics
+        for ext in hdul[1:]:
+            if isinstance(ext, fits.ImageHDU):
+                hdu_list.append(ext.copy())
         
         fits.HDUList(hdu_list).writeto(output_path, overwrite=True)
     
@@ -3783,9 +4544,10 @@ def save_without_astrometry(file_path, output_dir, config):
         primary_hdu = fits.PrimaryHDU(data, header=header)
         hdu_list = [primary_hdu]
         
-        # Preserve NOISE extension if present
-        if len(hdul) > 1 and hdul[1].name == 'NOISE':
-            hdu_list.append(hdul[1].copy())
+        # Preserve image extensions (NOISE, WEIGHT, etc.) for diagnostics
+        for ext in hdul[1:]:
+            if isinstance(ext, fits.ImageHDU):
+                hdu_list.append(ext.copy())
         
         fits.HDUList(hdu_list).writeto(output_path, overwrite=True)
     
@@ -3975,8 +4737,10 @@ def calculate_zp_check_quality(diff, config, status='OK'):
         return "GOOD"
     elif abs_diff < zp_thresh['medium']:
         return "MEDIUM"
-    else:
+    elif abs_diff < zp_thresh['poor']:
         return "POOR"
+    else:
+        return "VERY POOR"
 
 
 def update_zp_check_in_photometry_files(photometry_results, standard_checks, zp_checks, reduced_dir, config, verbose=False):
@@ -4259,6 +5023,18 @@ def main():
     logging.info(f"Input directory: {input_dir}")
     logging.info(f"Output directory: {output_dir}")
     logging.info(f"Config file: {args.config}")
+    if args.target:
+        logging.info(f"Target filter: astrometry/photometry only for OBJECT in {args.target}")
+    
+    # Parse target positions file (if provided via -f)
+    user_targets = None
+    if args.target_file:
+        try:
+            user_targets = parse_target_file(args.target_file)
+            logging.info(f"Loaded {len(user_targets)} target positions from {args.target_file}")
+        except Exception as e:
+            logging.warning(f"Failed to parse target file {args.target_file}: {e}")
+    
     logging.info("")
     
     # Step 1: Gunzip files
@@ -4293,10 +5069,6 @@ def main():
         # Process groups
         processable_groups = valid_groups + incomplete_groups
         
-        # First pass: sky subtraction for all groups
-        all_skysub_by_group = []  # Collect for thermal correction
-        group_results = []  # Store results for second pass
-        
         for group in processable_groups:
             is_incomplete = group in incomplete_groups
             
@@ -4310,15 +5082,6 @@ def main():
             shutil.copy2(sky_path, sky_reduced_path)
             generate_preview_jpg(sky_reduced_path, config)
             
-            # Collect for thermal correction
-            all_skysub_by_group.append((group['key'], skysub_files))
-            group_results.append((group, skysub_files, group_name, is_incomplete))
-        
-        # Apply thermal residual correction to all skysub files
-        apply_thermal_residual_correction(all_skysub_by_group, config, system_dir, args.verbose)
-        
-        # Second pass: alignment and coadding
-        for group, skysub_files, group_name, is_incomplete in group_results:
             # Alignment (using drizzling algorithm)
             aligned_files = align_frames(skysub_files, config, system, system_dir, args.verbose)
             
@@ -4335,7 +5098,19 @@ def main():
     logging.info("")
     logging.info("Grouping coadds by position and downloading catalogs...")
     
-    position_groups = group_coadds_by_position(all_coadd_files, config, args.verbose)
+    # When -t/--target is given, only download catalogs for matching OBJECTs
+    if args.target:
+        coadds_for_catalogs = []
+        for cp in all_coadd_files:
+            with fits.open(cp) as _hdul:
+                obj = _hdul[0].header.get('OBJECT', '').strip()
+            if obj in args.target:
+                coadds_for_catalogs.append(cp)
+        logging.info(f"  Target filter active: {len(coadds_for_catalogs)}/{len(all_coadd_files)} coadds match {args.target}")
+    else:
+        coadds_for_catalogs = all_coadd_files
+    
+    position_groups = group_coadds_by_position(coadds_for_catalogs, config, args.verbose)
     catalog_map = download_catalogs_for_groups(position_groups, config, catalog_dir, args.verbose)
     
     # Check if any catalogs were downloaded
@@ -4365,7 +5140,9 @@ def main():
 
     for coadd_path in all_coadd_files:
         if coadd_path not in catalog_map:
-            logging.warning(f"No catalog for {os.path.basename(coadd_path)}")
+            save_without_astrometry(coadd_path, reduced_dir, config)
+            for aligned_path in coadd_to_aligned.get(coadd_path, []):
+                save_without_astrometry(aligned_path, reduced_dir, config)
             continue
 
         catalog_path = catalog_map[coadd_path]
@@ -4373,9 +5150,20 @@ def main():
         # Major division for each coadd (always printed)
         log_big_divider(f"Processing {os.path.basename(coadd_path)}")
 
-        # Check if filter should skip astrometry (e.g., GRISM, dispersed modes)
+        # Read header once for filter and object checks
         with fits.open(coadd_path) as _hdul:
             _filter_name = _hdul[0].header.get('FILTER', '').strip()
+            _object_name = _hdul[0].header.get('OBJECT', '').strip()
+
+        # If -t/--target was given, skip astrometry/photometry for non-matching OBJECTs
+        if args.target and _object_name not in args.target:
+            logging.info(f"  OBJECT '{_object_name}' not in target list — skipping astrometry/photometry")
+            save_without_astrometry(coadd_path, reduced_dir, config)
+            for aligned_path in coadd_to_aligned.get(coadd_path, []):
+                save_without_astrometry(aligned_path, reduced_dir, config)
+            continue
+
+        # Check if filter should skip astrometry (e.g., GRISM, dispersed modes)
         skip_filters = config.get('astrometry', {}).get('skip_filters', [])
         if _filter_name in skip_filters:
             logging.info(f"  Filter '{_filter_name}' in skip_filters — copying as-is")
@@ -4419,7 +5207,8 @@ def main():
             # Photometric calibration on the astrometrized coadd (only for JHK filters)
             try:
                 phot_success, calib_info = photometric_calibration(
-                    astro_coadd_path, catalog_path, config, reduced_dir, args.verbose
+                    astro_coadd_path, catalog_path, config, reduced_dir, args.verbose,
+                    targets=user_targets
                 )
                 if phot_success and calib_info is not None:
                     STATS['photometrized'] += 1
@@ -4436,7 +5225,8 @@ def main():
             for astro_aligned_path in astro_aligned_paths:
                 try:
                     aligned_phot_success, aligned_calib_info = photometric_calibration(
-                        astro_aligned_path, catalog_path, config, reduced_dir, args.verbose
+                        astro_aligned_path, catalog_path, config, reduced_dir, args.verbose,
+                        targets=user_targets
                     )
                     if aligned_phot_success and aligned_calib_info is not None:
                         STATS['photometrized'] += 1
